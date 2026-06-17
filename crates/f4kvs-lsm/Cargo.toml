@@ -1,0 +1,45 @@
+[package]
+name = "f4kvs-lsm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LSM-tree storage engine for F4KVS"
+
+[dependencies]
+f4kvs-value = { workspace = true }
+f4kvs-storage-core = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+thiserror = "1.0"
+dashmap = "5.5"
+crossbeam = "0.8"
+tempfile = { workspace = true }
+tracing = { workspace = true }
+log = { workspace = true }
+chrono = { workspace = true }
+crc32fast = "1.3"
+
+[features]
+default = []
+metrics = []
+# Stub for optional TTL integration (wired by f4kvs-v2 when needed).
+ttl = []
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile.workspace = true
+criterion = { workspace = true, features = ["html_reports"] }
+rand = { workspace = true }
+serde_json.workspace = true
+proptest = { workspace = true }
+
+[lib]
+name = "f4kvs_lsm"
+path = "src/lib.rs"

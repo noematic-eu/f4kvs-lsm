@@ -1,0 +1,30 @@
+[package]
+name = "f4kvs-storage-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core traits, configuration, and utilities for F4KVS storage engines"
+
+[dependencies]
+f4kvs-value = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "1.0"
+tracing = { workspace = true }
+chrono = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile.workspace = true
+
+[lib]
+name = "f4kvs_storage_core"
+path = "src/lib.rs"

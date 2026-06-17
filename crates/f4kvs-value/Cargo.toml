@@ -1,0 +1,31 @@
+[package]
+name = "f4kvs-value"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Baptiste Boussemart <contact@f4kvs.dev>"]
+license = "Apache-2.0"
+repository = "https://github.com/f4kvs/f4kvs-lsm"
+description = "Value and error types for the F4KVS LSM stack"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+bincode = { version = "2", features = ["serde"] }
+
+[features]
+default = []
+proptest = ["dep:proptest"]
+
+[dependencies.proptest]
+version = "1.9"
+optional = true
+
+[dev-dependencies]
+proptest = "1.9"
+tokio = { version = "1.48", features = ["rt", "time"] }
+
+[lib]
+name = "f4kvs_value"
+path = "src/lib.rs"

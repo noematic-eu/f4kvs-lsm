@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/f4kvs-value",
+    "crates/f4kvs-storage-core",
+    "crates/f4kvs-lsm",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Baptiste Boussemart <contact@f4kvs.dev>"]
+license = "Apache-2.0"
+repository = "https://github.com/f4kvs/f4kvs-lsm"
+homepage = "https://f4kvs.dev"
+keywords = ["key-value", "storage", "database", "lsm-tree"]
+categories = ["database", "storage"]
+
+[workspace.dependencies]
+f4kvs-value = { path = "crates/f4kvs-value", version = "0.3.0" }
+f4kvs-storage-core = { path = "crates/f4kvs-storage-core", version = "0.3.0" }
+f4kvs-lsm = { path = "crates/f4kvs-lsm", version = "0.3.0" }
+
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+bytes = "1.11"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tempfile = "3.5"
+futures = "0.3"
+rand = "0.8"
+tokio-test = "0.4"
+bincode = "1.3"
+async-trait = "0.1"
+dashmap = "5.5"
+crossbeam = "0.8"
+crc32fast = "1.3"
+log = "0.4"
+proptest = "1.9"
+criterion = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.test]
+opt-level = 0
+debug = true

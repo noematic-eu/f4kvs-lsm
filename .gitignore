@@ -1,0 +1,39 @@
+# Rust / Cargo
+/target/
+
+# Backup files created by rustfmt or editors
+**/*.rs.bk
+
+# Criterion benchmark reports (dev-dependency with html_reports)
+/target/criterion/
+
+# Local runtime data (default config paths)
+/f4kvs_data/
+/f4kvs_lsm_data/
+/data/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+*.profraw
+*.profdata
+/coverage/
+lcov.info
+tarpaulin-report.html
+
+# Debugging
+*.pdb
