@@ -390,6 +390,9 @@ pub struct PerformanceConfig {
     /// Maximum batch size for batch operations (DoS protection)
     /// Default: 10,000 items
     pub max_batch_size: usize,
+
+    /// SSTable entry block cache size in bytes
+    pub block_cache_size: usize,
 }
 
 impl Default for PerformanceConfig {
@@ -402,6 +405,7 @@ impl Default for PerformanceConfig {
             enable_parallel_reads: true,
             max_parallel_reads: 4,
             max_batch_size: 10_000, // Default: 10,000 items per batch (DoS protection)
+            block_cache_size: 256 * 1024 * 1024, // 256MB
         }
     }
 }
@@ -438,6 +442,7 @@ impl LsmConfig {
         // Configure bloom filters
         lsm_config.bloom_filter.enabled = config.cache.enable_bloom_filters;
         lsm_config.bloom_filter.bits_per_key = config.cache.bloom_filter_bits_per_key as usize;
+        lsm_config.performance.block_cache_size = config.cache.block_cache_size as usize;
 
         lsm_config
     }

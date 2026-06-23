@@ -2,6 +2,7 @@
 
 use crate::core::config::SstableConfig;
 use crate::error::{LsmError, Result};
+use crate::storage::SharedBlockCache;
 use crate::utils;
 use crc32fast::Hasher as Crc32Hasher;
 use f4kvs_value::Value;
@@ -930,8 +931,16 @@ impl SSTable {
         true
     }
 
+    fn block_cache_key(&self, offset: u64) -> String {
+        format!("{}:{}", self.path.display(), offset)
+    }
+
     /// Get value by key with resilient file handling
-    pub async fn get(&self, key: &str) -> Result<Option<Value>> {
+    pub async fn get(
+        &self,
+        key: &str,
+        block_cache: Option<&SharedBlockCache>,
+    ) -> Result<Option<Value>> {
         // CRITICAL: Check if SSTable is ready before allowing reads
         // This prevents reads from happening before metadata/index are fully loaded
         if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
@@ -1123,7 +1132,7 @@ impl SSTable {
         let base_retry_delay = Duration::from_millis(self.config.retry_delay_ms / 2);
 
         loop {
-            match self.try_read_entry(offset).await {
+            match self.try_read_entry(offset, block_cache).await {
                 Ok(entry) => {
                     // Manually decrement reader count before returning on success
                     guard.decrement();
@@ -1176,7 +1185,20 @@ impl SSTable {
     }
 
     /// Try to read an entry from file with checksum validation
-    async fn try_read_entry(&self, offset: u64) -> Result<SSTableEntry> {
+    async fn try_read_entry(
+        &self,
+        offset: u64,
+        block_cache: Option<&SharedBlockCache>,
+    ) -> Result<SSTableEntry> {
+        let cache_key = self.block_cache_key(offset);
+        if let Some(cache) = block_cache {
+            if let Some(cached) = cache.get(&cache_key).await {
+                if let Ok(entry) = bincode::deserialize::<SSTableEntry>(&cached) {
+                    return Ok(entry);
+                }
+            }
+        }
+
         // CRITICAL: Check if SSTable is ready before reading
         // This prevents reads from happening before metadata/index are fully loaded
         if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
@@ -1399,6 +1421,12 @@ impl SSTable {
         let entry: SSTableEntry = bincode::deserialize(&entry_buffer)
             .map_err(|e| LsmError::Serialization(format!("Failed to deserialize entry: {}", e)))?;
 
+        if let Some(cache) = block_cache {
+            if let Ok(cached) = bincode::serialize(&entry) {
+                cache.put(cache_key, cached).await;
+            }
+        }
+
         Ok(entry)
     }
 
@@ -1472,7 +1500,7 @@ impl SSTable {
             if !key.starts_with(prefix) {
                 break;
             }
-            if let Ok(entry) = self.try_read_entry(*offset).await {
+            if let Ok(entry) = self.try_read_entry(*offset, None).await {
                 entries.push((key.clone(), entry.value, entry.deleted));
             }
         }
@@ -1495,13 +1523,13 @@ impl SSTable {
 
         if let Some(end_bound) = end_bound {
             for (key, (offset, _)) in self.index.range(start.to_string()..end_bound) {
-                if let Ok(entry) = self.try_read_entry(*offset).await {
+                if let Ok(entry) = self.try_read_entry(*offset, None).await {
                     entries.push((key.clone(), entry.value, entry.deleted));
                 }
             }
         } else {
             for (key, (offset, _)) in self.index.range(start.to_string()..) {
-                if let Ok(entry) = self.try_read_entry(*offset).await {
+                if let Ok(entry) = self.try_read_entry(*offset, None).await {
                     entries.push((key.clone(), entry.value, entry.deleted));
                 }
             }
@@ -1514,7 +1542,7 @@ impl SSTable {
         let mut entries = Vec::new();
 
         for (key, (offset, _)) in &self.index {
-            if let Ok(entry) = self.try_read_entry(*offset).await {
+            if let Ok(entry) = self.try_read_entry(*offset, None).await {
                 entries.push((key.clone(), entry.value, entry.deleted));
             }
         }
@@ -1569,7 +1597,7 @@ impl SSTable {
                 continue;
             }
 
-            match self.try_read_entry(*offset).await {
+            match self.try_read_entry(*offset, None).await {
                 Ok(entry) => {
                     // Verify the key matches (sanity check)
                     if entry.key == *key {

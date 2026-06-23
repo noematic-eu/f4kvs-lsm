@@ -10,7 +10,9 @@ use crate::storage::sstable::SSTableEntry;
 use crate::{
     compaction::CompactionManager,
     error::{LsmError, Result},
-    storage::{Memtable, MemtableLookupResult, PutEffect, SSTable, WALEntry, WALManager},
+    storage::{
+        Memtable, MemtableLookupResult, PutEffect, SSTable, SharedBlockCache, WALEntry, WALManager,
+    },
     utils,
     utils::LsmStats,
 };
@@ -97,6 +99,9 @@ pub struct LsmTreeEngine {
 
     /// Live key count (O(1) `count()`); rebuilt on open, maintained incrementally on writes/deletes.
     live_key_count: AtomicU64,
+
+    /// Shared LRU cache for SSTable entry blocks (avoids repeated disk reads on hot keys).
+    block_cache: SharedBlockCache,
 }
 
 impl LsmTreeEngine {
@@ -163,6 +168,8 @@ impl LsmTreeEngine {
             config
         );
 
+        let block_cache = SharedBlockCache::new(config.performance.block_cache_size);
+
         Ok(Self {
             config,
             active_memtable,
@@ -181,6 +188,7 @@ impl LsmTreeEngine {
             sequence_number: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             operation_guard: Arc::new(RwLock::new(())),
             live_key_count: AtomicU64::new(0),
+            block_cache,
         })
     }
 
@@ -1385,6 +1393,7 @@ impl LsmTreeEngine {
 
     /// Open an SSTable file if needed (brief write lock).
     async fn ensure_sstable_open(&self, level: usize, idx: usize) {
+        let _ = self.ensure_file_handle_capacity().await;
         if let Ok(mut sstables) = self.sstables.try_write() {
             if let Some(level_sstables) = sstables.get_mut(&level) {
                 if let Some(sstable) = level_sstables.get_mut(idx) {
@@ -1500,7 +1509,7 @@ impl LsmTreeEngine {
                 let sstable = &*sstable;
                 #[cfg(feature = "metrics")]
                 record_sstable_read(&self.metrics);
-                match sstable.get(key).await {
+                match sstable.get(key, Some(&self.block_cache)).await {
                     Ok(Some(value)) => return Ok(Some(value)),
                     Ok(None) => {}
                     Err(e) => debug!("Error reading from SSTable L{level}[{idx}]: {e}"),
@@ -1513,7 +1522,6 @@ impl LsmTreeEngine {
 
     /// Ensure we have capacity for opening a new file handle
     /// Closes least recently used files if we're at the limit
-    #[allow(dead_code)]
     async fn ensure_file_handle_capacity(&self) -> Result<()> {
         let max_open = self.config.sstable.max_open_files;
 
@@ -2215,15 +2223,29 @@ impl StorageEngine for LsmTreeEngine {
     async fn stats(&self) -> std::result::Result<F4KvsStorageStats, F4KvsError> {
         let stats = self.stats.read().await;
         let total_keys = self.live_key_count.load(Ordering::Relaxed);
+        let block_cache = self.block_cache.metrics().await;
 
         Ok(F4KvsStorageStats {
             total_keys,
             total_size_bytes: stats.total_bytes_written,
-            cache_stats: f4kvs_storage_core::stats::CacheStats::default(),
+            cache_stats: f4kvs_storage_core::stats::CacheStats {
+                block_cache: f4kvs_storage_core::stats::CacheMetrics {
+                    capacity: block_cache.capacity,
+                    usage: block_cache.usage,
+                    hit_count: block_cache.hit_count,
+                    miss_count: block_cache.miss_count,
+                    hit_rate: block_cache.hit_rate,
+                    eviction_count: block_cache.eviction_count,
+                },
+                ..Default::default()
+            },
             io_stats: f4kvs_storage_core::stats::IoStats::default(),
             compaction_stats: f4kvs_storage_core::stats::CompactionStats::default(),
             cf_stats: HashMap::new(),
-            memory_stats: f4kvs_storage_core::stats::MemoryStats::default(),
+            memory_stats: f4kvs_storage_core::stats::MemoryStats {
+                block_cache_usage: block_cache.usage,
+                ..Default::default()
+            },
             wal_stats: None,
             health: f4kvs_storage_core::stats::HealthStats::default(),
             timestamp: SystemTime::now(),
