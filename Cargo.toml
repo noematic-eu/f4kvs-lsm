@@ -4,6 +4,7 @@ members = [
     "crates/f4kvs-value",
     "crates/f4kvs-storage-core",
     "crates/f4kvs-lsm",
+    "crates/f4kvs-bench",
 ]
 
 [workspace.package]

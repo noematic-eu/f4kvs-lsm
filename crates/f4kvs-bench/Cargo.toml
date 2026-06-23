@@ -1,0 +1,23 @@
+[package]
+name = "f4kvs-bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trimmed redb-style benchmark harness for f4kvs-lsm with SLO gates"
+publish = false
+
+[[bin]]
+name = "f4kvs-trimmed-bench"
+path = "src/main.rs"
+
+[dependencies]
+f4kvs-lsm = { workspace = true }
+f4kvs-storage-core = { workspace = true }
+f4kvs-value = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+fastrand = "2.0"
+walkdir = "2.5"
+byte-unit = "5.1"
