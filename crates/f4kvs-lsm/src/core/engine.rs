@@ -10,7 +10,7 @@ use crate::storage::sstable::SSTableEntry;
 use crate::{
     compaction::CompactionManager,
     error::{LsmError, Result},
-    storage::{Memtable, SSTable, WALEntry, WALManager},
+    storage::{Memtable, MemtableLookupResult, SSTable, WALEntry, WALManager},
     utils,
     utils::LsmStats,
 };
@@ -23,7 +23,7 @@ use f4kvs_storage_core::{
 #[cfg(feature = "ttl")]
 use f4kvs_ttl::TTLManager;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -1249,48 +1249,35 @@ impl LsmTreeEngine {
         Ok(())
     }
 
-    /// Get value from memtables (fast path)
+    /// Get value from memtables (fast path, single lock per memtable)
     async fn get_from_memtables(&self, key: &str) -> Result<Option<Value>> {
-        // Check active memtable first
         {
             let memtable = self.active_memtable.read().await;
-            if memtable.is_tombstone(key).await? {
-                // Key was deleted (tombstone exists)
-                debug!("Key '{}' was deleted (tombstone in active memtable)", key);
-                return Ok(None);
-            } else if memtable.exists(key).await? {
-                // Key exists in active memtable (not a tombstone)
-                if let Some(value) = memtable.get(key).await? {
-                    debug!("Found key '{}' in active memtable: {:?}", key, value);
+            match memtable.lookup(key).await? {
+                MemtableLookupResult::Found(value) => {
+                    debug!("Found key '{}' in active memtable", key);
                     return Ok(Some(value));
                 }
+                MemtableLookupResult::Tombstone => {
+                    debug!("Key '{}' tombstoned in active memtable", key);
+                    return Ok(None);
+                }
+                MemtableLookupResult::Missing => {}
             }
         }
 
-        // Check immutable memtables
         let immutable = self.immutable_memtables.read().await;
-        debug!(
-            "Checking {} immutable memtables for key '{}'",
-            immutable.len(),
-            key
-        );
         for (i, memtable) in immutable.iter().enumerate() {
-            if memtable.is_tombstone(key).await? {
-                // Key was deleted (tombstone exists)
-                debug!(
-                    "Key '{}' was deleted (tombstone in immutable memtable {})",
-                    key, i
-                );
-                return Ok(None);
-            } else if memtable.exists(key).await? {
-                // Key exists in this memtable (not a tombstone)
-                if let Some(value) = memtable.get(key).await? {
-                    debug!(
-                        "Found key '{}' in immutable memtable {}: {:?}",
-                        key, i, value
-                    );
+            match memtable.lookup(key).await? {
+                MemtableLookupResult::Found(value) => {
+                    debug!("Found key '{}' in immutable memtable {}", key, i);
                     return Ok(Some(value));
                 }
+                MemtableLookupResult::Tombstone => {
+                    debug!("Key '{}' tombstoned in immutable memtable {}", key, i);
+                    return Ok(None);
+                }
+                MemtableLookupResult::Missing => {}
             }
         }
 
@@ -1299,18 +1286,16 @@ impl LsmTreeEngine {
 
     /// Check if a key has a tombstone in any memtable
     async fn has_tombstone_in_memtables(&self, key: &str) -> Result<bool> {
-        // Check active memtable first
         {
             let memtable = self.active_memtable.read().await;
-            if memtable.is_tombstone(key).await? {
+            if matches!(memtable.lookup(key).await?, MemtableLookupResult::Tombstone) {
                 return Ok(true);
             }
         }
 
-        // Check immutable memtables
         let immutable = self.immutable_memtables.read().await;
         for memtable in immutable.iter() {
-            if memtable.is_tombstone(key).await? {
+            if matches!(memtable.lookup(key).await?, MemtableLookupResult::Tombstone) {
                 return Ok(true);
             }
         }
@@ -1318,168 +1303,153 @@ impl LsmTreeEngine {
         Ok(false)
     }
 
-    /// Get value from SSTables (slow path)
-    ///
-    /// This function uses a two-phase locking strategy to minimize lock contention:
-    /// 1. Phase 1 (Read Lock): Iterate through SSTables to identify which need file opening
-    /// 2. Phase 2 (Brief Write Lock): Open files that need opening
-    /// 3. Phase 3 (Read Lock): Read from SSTables with minimal lock contention
-    async fn get_from_sstables(&self, key: &str) -> Result<Option<Value>> {
-        // Ensure we have space for opening files before searching
-        self.ensure_file_handle_capacity().await?;
+    /// Apply one storage layer onto a merged scan map (newer layers call this later).
+    fn apply_scan_layer(merged: &mut BTreeMap<String, Value>, entries: Vec<(String, Value, bool)>) {
+        for (key, value, deleted) in entries {
+            if deleted {
+                merged.remove(&key);
+            } else {
+                merged.insert(key, value);
+            }
+        }
+    }
 
-        // Phase 1: Collect SSTables that need file opening (with read lock)
-        let sstables_to_open: Vec<(usize, usize)> = {
+    /// Binary search for the SSTable that may contain `key` on non-overlapping levels.
+    fn find_sstable_for_key(sstables: &[SSTable], key: &str) -> Option<usize> {
+        if sstables.is_empty() {
+            return None;
+        }
+        let idx = sstables.partition_point(|s| s.metadata().largest_key.as_str() < key);
+        if idx < sstables.len() {
+            let meta = sstables[idx].metadata();
+            if key >= meta.smallest_key.as_str() && key <= meta.largest_key.as_str() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Open an SSTable file if needed (brief write lock).
+    async fn ensure_sstable_open(&self, level: usize, idx: usize) {
+        if let Ok(mut sstables) = self.sstables.try_write() {
+            if let Some(level_sstables) = sstables.get_mut(&level) {
+                if let Some(sstable) = level_sstables.get_mut(idx) {
+                    if !sstable.is_open() {
+                        let _ = sstable.ensure_file_open().await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merge scan layers (SSTables → immutable memtables → active memtable).
+    async fn merge_scan_prefix_with_values(&self, prefix: &str) -> Result<Vec<(String, Value)>> {
+        let _op_guard = self.operation_guard.read().await;
+        let mut merged = BTreeMap::new();
+
+        {
             let sstables = self.sstables.read().await;
-            let mut to_open = Vec::new();
-
             for level in 0..self.config.levels.count {
                 if let Some(level_sstables) = sstables.get(&level) {
-                    for (idx, sstable) in level_sstables.iter().enumerate() {
-                        if !sstable.is_open() {
-                            to_open.push((level, idx));
-                        }
+                    for sstable in level_sstables {
+                        let entries = sstable.scan_prefix_layer(prefix).await?;
+                        Self::apply_scan_layer(&mut merged, entries);
                     }
-                }
-            }
-            to_open
-        };
-
-        // Phase 2: Open files that need opening (non-blocking write lock per level)
-        // Use try_write with retries to avoid blocking when compaction is running
-        if !sstables_to_open.is_empty() {
-            // Group by level to minimize write lock acquisitions
-            use std::collections::HashMap;
-            let mut by_level: HashMap<usize, Vec<usize>> = HashMap::new();
-            for (level, idx) in sstables_to_open {
-                by_level.entry(level).or_default().push(idx);
-            }
-
-            // Open files level by level with non-blocking write lock
-            for (level, indices) in by_level {
-                // Try to acquire write lock with retries (non-blocking)
-                let mut sstables_guard = None;
-                for retry in 0..5 {
-                    match self.sstables.try_write() {
-                        Ok(guard) => {
-                            sstables_guard = Some(guard);
-                            break;
-                        }
-                        Err(_) => {
-                            if retry < 4 {
-                                // Yield to allow other tasks to release the lock
-                                tokio::time::sleep(Duration::from_millis(10 * (retry as u64 + 1)))
-                                    .await;
-                            }
-                        }
-                    }
-                }
-
-                // If we got the lock, open files
-                if let Some(mut sstables) = sstables_guard {
-                    if let Some(level_sstables) = sstables.get_mut(&level) {
-                        for idx in indices {
-                            if let Some(sstable) = level_sstables.get_mut(idx) {
-                                if !sstable.is_open() {
-                                    // Brief write lock - just for opening the file
-                                    if let Err(e) = sstable.ensure_file_open().await {
-                                        warn!("Failed to open SSTable file: {}", e);
-                                        // Continue to next SSTable - don't fail entire operation
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Write lock released here
-                } else {
-                    // Couldn't acquire lock - files might already be open or will be opened by another task
-                    // Continue to Phase 3 - we'll try to read from files that are already open
-                    debug!("Could not acquire write lock to open SSTable files for level {}, will try reading from already-open files", level);
                 }
             }
         }
 
-        // Phase 3: Read from SSTables (with read lock - allows concurrent reads)
-        // If files weren't opened in Phase 2, retry opening them here with a brief write lock
-        let sstables = self.sstables.read().await;
-        let mut unopened_sstables: Vec<(usize, usize)> = Vec::new();
+        {
+            let immutable = self.immutable_memtables.read().await;
+            for memtable in immutable.iter() {
+                let entries = memtable.scan_prefix_layer(prefix).await?;
+                Self::apply_scan_layer(&mut merged, entries);
+            }
+        }
 
-        // First pass: identify unopened SSTables
+        {
+            let memtable = self.active_memtable.read().await;
+            let entries = memtable.scan_prefix_layer(prefix).await?;
+            Self::apply_scan_layer(&mut merged, entries);
+        }
+
+        Ok(merged.into_iter().collect())
+    }
+
+    async fn merge_scan_range_with_values(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<(String, Value)>> {
+        let _op_guard = self.operation_guard.read().await;
+        let mut merged = BTreeMap::new();
+
+        {
+            let sstables = self.sstables.read().await;
+            for level in 0..self.config.levels.count {
+                if let Some(level_sstables) = sstables.get(&level) {
+                    for sstable in level_sstables {
+                        let entries = sstable.scan_range_layer(start, end).await?;
+                        Self::apply_scan_layer(&mut merged, entries);
+                    }
+                }
+            }
+        }
+
+        {
+            let immutable = self.immutable_memtables.read().await;
+            for memtable in immutable.iter() {
+                let entries = memtable.scan_range_layer(start, end).await?;
+                Self::apply_scan_layer(&mut merged, entries);
+            }
+        }
+
+        {
+            let memtable = self.active_memtable.read().await;
+            let entries = memtable.scan_range_layer(start, end).await?;
+            Self::apply_scan_layer(&mut merged, entries);
+        }
+
+        Ok(merged.into_iter().collect())
+    }
+
+    /// Get value from SSTables (slow path)
+    async fn get_from_sstables(&self, key: &str) -> Result<Option<Value>> {
         for level in 0..self.config.levels.count {
-            if let Some(level_sstables) = sstables.get(&level) {
-                for (idx, sstable) in level_sstables.iter().enumerate() {
-                    if !sstable.is_open() {
-                        unopened_sstables.push((level, idx));
-                    }
-                }
-            }
-        }
-        drop(sstables);
-
-        // Try to open unopened files with a brief write lock
-        if !unopened_sstables.is_empty() {
-            use std::collections::HashMap;
-            let mut by_level: HashMap<usize, Vec<usize>> = HashMap::new();
-            for (level, idx) in unopened_sstables {
-                by_level.entry(level).or_default().push(idx);
-            }
-
-            for (level, indices) in by_level {
-                // Try once more to open files (non-blocking)
-                if let Ok(mut sstables) = self.sstables.try_write() {
-                    if let Some(level_sstables) = sstables.get_mut(&level) {
-                        for idx in indices {
-                            if let Some(sstable) = level_sstables.get_mut(idx) {
-                                if !sstable.is_open() {
-                                    if let Err(e) = sstable.ensure_file_open().await {
-                                        debug!("Failed to open SSTable file in retry: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Now read from SSTables
-        let sstables = self.sstables.read().await;
-
-        // Search from L0 to highest level (L0 may have overlapping keys)
-        for level in 0..self.config.levels.count {
-            if let Some(level_sstables) = sstables.get(&level) {
-                // For L0, iterate in reverse order (newest SSTables first)
-                // because L0 can have overlapping keys and we want the newest value
-                // For other levels, order doesn't matter as keys don't overlap
-                let indices: Vec<usize> = if level == 0 {
-                    (0..level_sstables.len()).rev().collect()
-                } else {
-                    (0..level_sstables.len()).collect()
+            let candidate_indices: Vec<usize> = {
+                let sstables = self.sstables.read().await;
+                let Some(level_sstables) = sstables.get(&level) else {
+                    continue;
                 };
+                if level == 0 {
+                    (0..level_sstables.len())
+                        .rev()
+                        .filter(|&idx| level_sstables[idx].key_may_exist(key))
+                        .collect()
+                } else {
+                    Self::find_sstable_for_key(level_sstables, key)
+                        .filter(|&idx| level_sstables[idx].key_may_exist(key))
+                        .into_iter()
+                        .collect()
+                }
+            };
 
-                for idx in indices {
-                    let sstable = &level_sstables[idx];
-                    // Skip SSTables marked for deletion (they're being compacted)
-                    // However, we still allow reads if they have active readers
-                    // This ensures data is accessible during compaction
-
-                    // Record SSTable read metric
-                    #[cfg(feature = "metrics")]
-                    record_sstable_read(&self.metrics);
-
-                    // Try to read from this SSTable
-                    // Even if marked for deletion, we allow reads (prevents data loss)
-                    // Note: sstable.get() takes &self, so we can use immutable reference
-                    // If file is not open, get() will return an error, which we'll handle gracefully
-                    match sstable.get(key).await {
-                        Ok(Some(value)) => return Ok(Some(value)),
-                        Ok(None) => continue, // Key not in this SSTable
-                        Err(e) => {
-                            // File might not be open or other error - log and continue
-                            debug!("Error reading from SSTable (might be closed): {}", e);
-                            continue;
-                        }
-                    }
+            for idx in candidate_indices {
+                self.ensure_sstable_open(level, idx).await;
+                let sstables = self.sstables.read().await;
+                let Some(sstable) = sstables
+                    .get(&level)
+                    .and_then(|level_sstables| level_sstables.get(idx))
+                else {
+                    continue;
+                };
+                let sstable = &*sstable;
+                #[cfg(feature = "metrics")]
+                record_sstable_read(&self.metrics);
+                match sstable.get(key).await {
+                    Ok(Some(value)) => return Ok(Some(value)),
+                    Ok(None) => {}
+                    Err(e) => debug!("Error reading from SSTable L{level}[{idx}]: {e}"),
                 }
             }
         }
@@ -1489,6 +1459,7 @@ impl LsmTreeEngine {
 
     /// Ensure we have capacity for opening a new file handle
     /// Closes least recently used files if we're at the limit
+    #[allow(dead_code)]
     async fn ensure_file_handle_capacity(&self) -> Result<()> {
         let max_open = self.config.sstable.max_open_files;
 
@@ -2104,16 +2075,9 @@ impl StorageEngine for LsmTreeEngine {
         &self,
         prefix: &str,
     ) -> std::result::Result<Vec<(String, Value)>, F4KvsError> {
-        let keys = self.scan_prefix(prefix).await?;
-        let mut results = Vec::new();
-
-        for key in keys {
-            if let Some(value) = self.get(&key).await? {
-                results.push((key, value));
-            }
-        }
-
-        Ok(results)
+        self.merge_scan_prefix_with_values(prefix)
+            .await
+            .map_err(Self::convert_error)
     }
 
     async fn scan_range_with_values(
@@ -2121,16 +2085,9 @@ impl StorageEngine for LsmTreeEngine {
         start: &str,
         end: &str,
     ) -> std::result::Result<Vec<(String, Value)>, F4KvsError> {
-        let keys = self.scan_range(start, end).await?;
-        let mut results = Vec::new();
-
-        for key in keys {
-            if let Some(value) = self.get(&key).await? {
-                results.push((key, value));
-            }
-        }
-
-        Ok(results)
+        self.merge_scan_range_with_values(start, end)
+            .await
+            .map_err(Self::convert_error)
     }
 
     async fn scan_range_limit_with_values(
@@ -2139,15 +2096,13 @@ impl StorageEngine for LsmTreeEngine {
         end: &str,
         limit: usize,
     ) -> std::result::Result<Vec<(String, Value)>, F4KvsError> {
-        let keys = self.scan_range_limit(start, end, limit).await?;
-        let mut results = Vec::new();
-
-        for key in keys {
-            if let Some(value) = self.get(&key).await? {
-                results.push((key, value));
-            }
+        let mut results = self
+            .merge_scan_range_with_values(start, end)
+            .await
+            .map_err(Self::convert_error)?;
+        if results.len() > limit {
+            results.truncate(limit);
         }
-
         Ok(results)
     }
 
@@ -3624,6 +3579,57 @@ mod tests {
     async fn test_lsm_engine_creation() {
         let (_engine, _temp_dir) = create_test_engine().await;
         // Engine creation should succeed
+    }
+
+    /// Mirrors the redb-bench harness: dedicated runtime thread + block_on from caller.
+    #[test]
+    fn test_engine_new_via_block_on_with_wal_fsync_async() {
+        use crate::core::config::WalSyncMode;
+        use std::sync::{mpsc, OnceLock};
+        use tokio::runtime::Handle;
+
+        fn runtime_handle() -> &'static Handle {
+            static HANDLE: OnceLock<Handle> = OnceLock::new();
+            HANDLE.get_or_init(|| {
+                let (tx, rx) = mpsc::sync_channel(1);
+                std::thread::Builder::new()
+                    .name("test-bench-runtime".into())
+                    .spawn(move || {
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(4)
+                            .enable_all()
+                            .build()
+                            .expect("runtime");
+                        tx.send(rt.handle().clone()).expect("handle");
+                        rt.block_on(std::future::pending::<()>());
+                    })
+                    .expect("spawn");
+                rx.recv().expect("handle")
+            })
+        }
+
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut config = LsmConfig::default();
+        config.data_dir = temp_dir.path().to_path_buf();
+        config.wal.dir = temp_dir.path().join("wal");
+        config.wal.enabled = true;
+        config.wal.sync_mode = WalSyncMode::FsyncAsync;
+        config.compaction.background_enabled = false;
+
+        let engine = runtime_handle().block_on(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                LsmTreeEngine::new(config),
+            )
+            .await
+        });
+        let engine = engine.expect("timeout").expect("engine new");
+        let items: Vec<_> = (0..1000)
+            .map(|i| (format!("key{i:08}"), Value::String("v".into())))
+            .collect();
+        runtime_handle()
+            .block_on(async move { engine.batch_put(items).await })
+            .expect("batch put");
     }
 
     #[tokio::test]

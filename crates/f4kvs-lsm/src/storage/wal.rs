@@ -233,22 +233,35 @@ impl WALSegment {
                 // TODO: Add metrics collection here for fsync latency
             }
             WalSyncMode::FsyncAsync => {
-                // Async fsync - spawn in background
-                let file = self.file.try_clone().await.map_err(LsmError::Io)?;
-                tokio::spawn(async move {
-                    // Sync in background - errors are logged but don't block
+                // Detach fsync to an OS thread — avoids tokio::spawn deadlock when callers
+                // use block_on on the same runtime (FFI / sync bench harness).
+                let path = self.path.clone();
+                std::thread::spawn(move || {
                     let start_time = std::time::Instant::now();
-                    if let Err(e) = file.sync_all().await {
-                        warn!(
-                            "Background fsync failed: {} (latency: {:?}ms)",
-                            e,
-                            start_time.elapsed().as_millis()
-                        );
-                    } else {
-                        debug!(
-                            "WAL segment synced to disk (async fsync) in {:?}ms",
-                            start_time.elapsed().as_millis()
-                        );
+                    match std::fs::OpenOptions::new().write(true).open(&path) {
+                        Ok(file) => {
+                            if let Err(e) = file.sync_all() {
+                                warn!(
+                                    "Background fsync failed for {:?}: {} (latency: {:?}ms)",
+                                    path,
+                                    e,
+                                    start_time.elapsed().as_millis()
+                                );
+                            } else {
+                                debug!(
+                                    "WAL segment synced to disk (async fsync) in {:?}ms",
+                                    start_time.elapsed().as_millis()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Background fsync could not open {:?}: {} (latency: {:?}ms)",
+                                path,
+                                e,
+                                start_time.elapsed().as_millis()
+                            );
+                        }
                     }
                 });
                 debug!("WAL segment sync started in background (async fsync)");

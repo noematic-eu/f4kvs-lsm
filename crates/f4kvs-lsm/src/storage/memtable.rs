@@ -7,6 +7,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Result of a single-key memtable lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemtableLookupResult {
+    Found(Value),
+    Tombstone,
+    Missing,
+}
+
 /// Memtable for LSM Tree Engine
 ///
 /// Provides fast in-memory storage with sorted key-value pairs.
@@ -87,6 +95,16 @@ impl Memtable {
             Value::Bytes(b) => b.len(),
             Value::Json(v) => v.to_string().len(),
             Value::Null => 0,
+        }
+    }
+
+    /// Single-pass key lookup (found value, tombstone, or missing).
+    pub async fn lookup(&self, key: &str) -> Result<MemtableLookupResult> {
+        let data = self.data.read().await;
+        match data.get(key) {
+            Some(Value::Null) => Ok(MemtableLookupResult::Tombstone),
+            Some(value) => Ok(MemtableLookupResult::Found(value.clone())),
+            None => Ok(MemtableLookupResult::Missing),
         }
     }
 
@@ -193,43 +211,50 @@ impl Memtable {
 
     /// Scan keys in a range
     pub async fn scan_range(&self, start: &str, end: &str) -> Result<Vec<String>> {
-        let data = self.data.read().await;
-        let mut keys = Vec::new();
+        let entries = self.scan_range_layer(start, end).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, _, deleted)| !deleted)
+            .map(|(key, _, _)| key)
+            .collect())
+    }
 
-        // For range scanning, we want to include keys that start with the end prefix
-        // So we create an exclusive upper bound by incrementing the last character
-        let end_bound = if end.is_empty() {
-            // If end is empty, scan to the end
-            None
-        } else {
-            // Create an exclusive upper bound by incrementing the last character
-            let mut next_key = end.to_string();
-            if let Some(last_char) = next_key.pop() {
-                if let Some(next_char) = char::from_u32(last_char as u32 + 1) {
-                    next_key.push(next_char);
-                } else {
-                    // If we can't increment, append a character to make it exclusive
-                    next_key = end.to_string() + "\x01";
-                }
+    /// Scan prefix entries including tombstones (for layer merge).
+    pub async fn scan_prefix_layer(&self, prefix: &str) -> Result<Vec<(String, Value, bool)>> {
+        let data = self.data.read().await;
+        let mut entries = Vec::new();
+        for (key, value) in data.range(prefix.to_string()..) {
+            if !key.starts_with(prefix) {
+                break;
             }
-            Some(next_key)
-        };
+            let deleted = matches!(value, Value::Null);
+            entries.push((key.clone(), value.clone(), deleted));
+        }
+        Ok(entries)
+    }
+
+    /// Scan range entries including tombstones (for layer merge).
+    pub async fn scan_range_layer(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<(String, Value, bool)>> {
+        let data = self.data.read().await;
+        let mut entries = Vec::new();
+        let end_bound = crate::utils::exclusive_range_end(end);
 
         if let Some(end_bound) = end_bound {
             for (key, value) in data.range(start.to_string()..end_bound) {
-                if !matches!(value, Value::Null) {
-                    keys.push(key.clone());
-                }
+                let deleted = matches!(value, Value::Null);
+                entries.push((key.clone(), value.clone(), deleted));
             }
         } else {
             for (key, value) in data.range(start.to_string()..) {
-                if !matches!(value, Value::Null) {
-                    keys.push(key.clone());
-                }
+                let deleted = matches!(value, Value::Null);
+                entries.push((key.clone(), value.clone(), deleted));
             }
         }
-
-        Ok(keys)
+        Ok(entries)
     }
 
     /// Get all entries for flushing

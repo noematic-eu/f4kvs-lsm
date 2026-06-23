@@ -672,7 +672,7 @@ impl SSTable {
     }
 
     /// Ensure file is open, re-opening if necessary
-    pub async fn ensure_file_open(&mut self) -> Result<()> {
+    pub async fn ensure_file_open(&self) -> Result<()> {
         let needs_open = {
             let file_guard = self.file.read().await;
             file_guard.is_none()
@@ -911,6 +911,25 @@ impl SSTable {
         Ok(filter)
     }
 
+    /// Fast check: key could exist in this SSTable (range + bloom). Does not touch the file.
+    pub fn key_may_exist(&self, key: &str) -> bool {
+        if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        if self.is_marked_for_deletion() {
+            return false;
+        }
+        if key < self.metadata.smallest_key.as_str() || key > self.metadata.largest_key.as_str() {
+            return false;
+        }
+        if let Some(ref bloom_filter) = self.bloom_filter {
+            if !bloom_filter.might_contain(key) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Get value by key with resilient file handling
     pub async fn get(&self, key: &str) -> Result<Option<Value>> {
         // CRITICAL: Check if SSTable is ready before allowing reads
@@ -921,6 +940,10 @@ impl SSTable {
                 The SSTable may still be being written or metadata/index may not be loaded.",
                 self.path
             )));
+        }
+
+        if !self.key_may_exist(key) {
+            return Ok(None);
         }
 
         // Increment reader count FIRST before any checks
@@ -1429,38 +1452,61 @@ impl SSTable {
 
     /// Scan keys in a range
     pub async fn scan_range(&self, start: &str, end: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
+        let entries = self.scan_range_layer(start, end).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, _, deleted)| !deleted)
+            .map(|(key, _, _)| key)
+            .collect())
+    }
 
-        // For range scanning, we want to include keys that start with the end prefix
-        // So we create an exclusive upper bound by incrementing the last character
-        let end_bound = if end.is_empty() {
-            // If end is empty, scan to the end
-            None
-        } else {
-            // Create an exclusive upper bound by incrementing the last character
-            let mut next_key = end.to_string();
-            if let Some(last_char) = next_key.pop() {
-                if let Some(next_char) = char::from_u32(last_char as u32 + 1) {
-                    next_key.push(next_char);
-                } else {
-                    // If we can't increment, append a character to make it exclusive
-                    next_key = end.to_string() + "\x01";
-                }
-            }
-            Some(next_key)
-        };
+    /// Scan prefix entries with values (includes tombstones for layer merge).
+    pub async fn scan_prefix_layer(&self, prefix: &str) -> Result<Vec<(String, Value, bool)>> {
+        if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        self.ensure_file_open().await?;
 
-        if let Some(end_bound) = end_bound {
-            for (key, _) in self.index.range(start.to_string()..end_bound) {
-                keys.push(key.clone());
+        let mut entries = Vec::new();
+        for (key, (offset, _)) in self.index.range(prefix.to_string()..) {
+            if !key.starts_with(prefix) {
+                break;
             }
-        } else {
-            for (key, _) in self.index.range(start.to_string()..) {
-                keys.push(key.clone());
+            if let Ok(entry) = self.try_read_entry(*offset).await {
+                entries.push((key.clone(), entry.value, entry.deleted));
             }
         }
+        Ok(entries)
+    }
 
-        Ok(keys)
+    /// Scan range entries with values (includes tombstones for layer merge).
+    pub async fn scan_range_layer(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<(String, Value, bool)>> {
+        if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        self.ensure_file_open().await?;
+
+        let mut entries = Vec::new();
+        let end_bound = crate::utils::exclusive_range_end(end);
+
+        if let Some(end_bound) = end_bound {
+            for (key, (offset, _)) in self.index.range(start.to_string()..end_bound) {
+                if let Ok(entry) = self.try_read_entry(*offset).await {
+                    entries.push((key.clone(), entry.value, entry.deleted));
+                }
+            }
+        } else {
+            for (key, (offset, _)) in self.index.range(start.to_string()..) {
+                if let Ok(entry) = self.try_read_entry(*offset).await {
+                    entries.push((key.clone(), entry.value, entry.deleted));
+                }
+            }
+        }
+        Ok(entries)
     }
 
     /// Scan all entries in the SSTable

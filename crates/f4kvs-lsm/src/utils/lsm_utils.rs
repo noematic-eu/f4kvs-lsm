@@ -47,6 +47,22 @@ pub fn calculate_bloom_filter_size(expected_elements: usize, false_positive_rate
     m.ceil() as usize
 }
 
+/// Exclusive upper bound for lexicographic range scans (start..end).
+pub fn exclusive_range_end(end: &str) -> Option<String> {
+    if end.is_empty() {
+        return None;
+    }
+    let mut next_key = end.to_string();
+    if let Some(last_char) = next_key.pop() {
+        if let Some(next_char) = char::from_u32(last_char as u32 + 1) {
+            next_key.push(next_char);
+        } else {
+            next_key = end.to_string() + "\x01";
+        }
+    }
+    Some(next_key)
+}
+
 /// Calculate optimal number of hash functions
 pub fn calculate_hash_functions(expected_elements: usize, filter_size: usize) -> usize {
     // k = (m/n) * ln(2)
