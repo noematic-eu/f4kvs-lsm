@@ -28,6 +28,11 @@ fn parse_args() -> SloConfig {
                     config.max_random_reads = d;
                 }
             }
+            "--max-len-ms" => {
+                if let Some(d) = parse_duration_ms("--max-len-ms", &mut args) {
+                    config.max_len = d;
+                }
+            }
             "--max-total-secs" => {
                 if let Some(v) = args.next().and_then(|s| s.parse::<u64>().ok()) {
                     config.max_total = Duration::from_secs(v);
@@ -39,6 +44,7 @@ fn parse_args() -> SloConfig {
                      \n\
                      Options:\n\
                        --max-random-reads-ms MS   random-read phase limit (default: 5000)\n\
+                       --max-len-ms MS            len() phase limit (default: 10)\n\
                        --max-total-secs SECS      full run wall limit (default: 900)\n"
                 );
                 process::exit(0);
@@ -59,8 +65,9 @@ fn main() {
 
     println!("Running f4kvs trimmed benchmark (50k reads, WAL off)...");
     println!(
-        "SLO gates: random reads <= {}ms, total <= {}s",
+        "SLO gates: random reads <= {}ms, len() <= {}ms, total <= {}s",
         slo.max_random_reads.as_millis(),
+        slo.max_len.as_millis(),
         slo.max_total.as_secs()
     );
 

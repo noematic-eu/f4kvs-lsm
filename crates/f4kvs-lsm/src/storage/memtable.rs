@@ -7,6 +7,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Effect of a put on memtable key visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutEffect {
+    Inserted,
+    UpdatedLive,
+    Resurrected,
+}
+
 /// Result of a single-key memtable lookup.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemtableLookupResult {
@@ -50,7 +58,7 @@ impl Memtable {
     }
 
     /// Put a key-value pair
-    pub async fn put(&mut self, key: &str, value: &Value) -> Result<()> {
+    pub async fn put(&mut self, key: &str, value: &Value) -> Result<PutEffect> {
         let key_size = key.len();
         let value_size = Self::estimate_value_size(value);
 
@@ -58,6 +66,12 @@ impl Memtable {
         let old_value = {
             let data = self.data.read().await;
             data.get(key).cloned()
+        };
+
+        let effect = match &old_value {
+            None => PutEffect::Inserted,
+            Some(Value::Null) => PutEffect::Resurrected,
+            Some(_) => PutEffect::UpdatedLive,
         };
 
         // Update size tracking
@@ -81,7 +95,7 @@ impl Memtable {
             data.insert(key.to_string(), value.clone());
         }
 
-        Ok(())
+        Ok(effect)
     }
 
     /// Estimate the size of a value in bytes

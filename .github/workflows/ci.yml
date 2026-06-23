@@ -30,4 +30,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run trimmed benchmark (release)
-        run: cargo run --release -p f4kvs-bench -- --max-random-reads-ms 5000 --max-total-secs 900
+        run: cargo run --release -p f4kvs-bench --bin f4kvs-trimmed-bench -- --max-random-reads-ms 5000 --max-len-ms 10 --max-total-secs 900

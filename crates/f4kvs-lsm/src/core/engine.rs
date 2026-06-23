@@ -10,7 +10,7 @@ use crate::storage::sstable::SSTableEntry;
 use crate::{
     compaction::CompactionManager,
     error::{LsmError, Result},
-    storage::{Memtable, MemtableLookupResult, SSTable, WALEntry, WALManager},
+    storage::{Memtable, MemtableLookupResult, PutEffect, SSTable, WALEntry, WALManager},
     utils,
     utils::LsmStats,
 };
@@ -26,7 +26,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -94,6 +94,9 @@ pub struct LsmTreeEngine {
     /// Operation guard to ensure compaction runs exclusively
     /// Read operations acquire read lock, compaction acquires write lock
     operation_guard: Arc<RwLock<()>>,
+
+    /// Live key count (O(1) `count()`); rebuilt on open, maintained incrementally on writes/deletes.
+    live_key_count: AtomicU64,
 }
 
 impl LsmTreeEngine {
@@ -177,7 +180,56 @@ impl LsmTreeEngine {
             background_tasks: Arc::new(RwLock::new(Vec::new())),
             sequence_number: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             operation_guard: Arc::new(RwLock::new(())),
+            live_key_count: AtomicU64::new(0),
         })
+    }
+
+    fn set_live_key_count(&self, count: u64) {
+        self.live_key_count
+            .store(count, Ordering::Release);
+    }
+
+    fn adjust_live_key_count(&self, delta: i64) {
+        if delta > 0 {
+            self.live_key_count
+                .fetch_add(delta as u64, Ordering::Relaxed);
+        } else if delta < 0 {
+            self.live_key_count
+                .fetch_sub((-delta) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Rebuild live key count from merged layers (startup / post-compaction).
+    async fn refresh_live_key_count(&self) -> Result<()> {
+        let pairs = self.merge_scan_prefix_with_values("").await?;
+        let count = pairs.len() as u64;
+        self.set_live_key_count(count);
+        {
+            let mut stats = self.stats.write().await;
+            stats.total_keys = count;
+        }
+        debug!("Refreshed live key count: {}", count);
+        Ok(())
+    }
+
+    async fn apply_put_key_count(&self, key: &str, effect: PutEffect) -> Result<()> {
+        let delta = match effect {
+            PutEffect::UpdatedLive => 0,
+            PutEffect::Resurrected => 1,
+            PutEffect::Inserted => {
+                if self.get_from_sstables(key).await?.is_some() {
+                    0
+                } else {
+                    1
+                }
+            }
+        };
+        if delta != 0 {
+            self.adjust_live_key_count(delta);
+            let mut stats = self.stats.write().await;
+            stats.total_keys = self.live_key_count.load(Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Create compaction manager based on configuration
@@ -207,6 +259,8 @@ impl LsmTreeEngine {
 
         // Load existing SSTables from disk
         self.load_existing_sstables().await?;
+
+        self.refresh_live_key_count().await?;
 
         Ok(())
     }
@@ -1585,13 +1639,17 @@ impl StorageEngine for LsmTreeEngine {
         }
 
         // Add to active memtable
-        {
+        let put_effect = {
             let mut memtable = self.active_memtable.write().await;
             memtable
                 .put(key, value)
                 .await
-                .map_err(Self::convert_error)?;
-        }
+                .map_err(Self::convert_error)?
+        };
+
+        self.apply_put_key_count(key, put_effect)
+            .await
+            .map_err(Self::convert_error)?;
 
         // Update statistics
         {
@@ -1697,6 +1755,8 @@ impl StorageEngine for LsmTreeEngine {
         // Acquire read lock to prevent compaction during delete
         let _op_guard = self.operation_guard.read().await;
 
+        let was_live = self.exists(key).await?;
+
         // Write tombstone to WAL
         if self.config.wal.enabled {
             {
@@ -1709,6 +1769,12 @@ impl StorageEngine for LsmTreeEngine {
         {
             let mut memtable = self.active_memtable.write().await;
             memtable.delete(key).await.map_err(Self::convert_error)?;
+        }
+
+        if was_live {
+            self.adjust_live_key_count(-1);
+            let mut stats = self.stats.write().await;
+            stats.total_keys = self.live_key_count.load(Ordering::Relaxed);
         }
 
         // Remove TTL if it exists
@@ -1791,15 +1857,19 @@ impl StorageEngine for LsmTreeEngine {
                 .map_err(Self::convert_error)?;
         }
 
-        // Add to active memtable
-        {
+        let put_effects: Vec<(String, PutEffect)> = {
             let mut memtable = self.active_memtable.write().await;
+            let mut effects = Vec::with_capacity(items.len());
             for (key, value) in &items {
-                memtable
-                    .put(key, value)
-                    .await
-                    .map_err(Self::convert_error)?;
+                let effect = memtable.put(key, value).await.map_err(Self::convert_error)?;
+                effects.push((key.clone(), effect));
             }
+            effects
+        };
+        for (key, effect) in put_effects {
+            self.apply_put_key_count(&key, effect)
+                .await
+                .map_err(Self::convert_error)?;
         }
 
         // Update statistics
@@ -2144,9 +2214,10 @@ impl StorageEngine for LsmTreeEngine {
 
     async fn stats(&self) -> std::result::Result<F4KvsStorageStats, F4KvsError> {
         let stats = self.stats.read().await;
+        let total_keys = self.live_key_count.load(Ordering::Relaxed);
 
         Ok(F4KvsStorageStats {
-            total_keys: stats.total_keys,
+            total_keys,
             total_size_bytes: stats.total_bytes_written,
             cache_stats: f4kvs_storage_core::stats::CacheStats::default(),
             io_stats: f4kvs_storage_core::stats::IoStats::default(),
@@ -2171,12 +2242,7 @@ impl StorageEngine for LsmTreeEngine {
 
     // Override count() to provide explicit implementation
     async fn count(&self) -> std::result::Result<u64, F4KvsError> {
-        // Get all keys and return the count
-        // Note: This is not efficient for large datasets, but it's the simplest implementation
-        // For better performance, we could maintain a counter, but that requires careful
-        // synchronization with deletes and updates
-        let keys = self.keys().await?;
-        Ok(keys.len() as u64)
+        Ok(self.live_key_count.load(Ordering::Relaxed))
     }
 
     async fn clear(&self) -> std::result::Result<(), F4KvsError> {
@@ -2219,6 +2285,7 @@ impl StorageEngine for LsmTreeEngine {
             let mut stats = self.stats.write().await;
             *stats = LsmStats::default();
         }
+        self.set_live_key_count(0);
 
         // Clear TTL manager - TTLManager doesn't have a clear method, so we'll skip it
         // The TTL entries will be cleaned up naturally as keys expire
@@ -2695,14 +2762,17 @@ impl StorageEngine for LsmTreeEngine {
             }
         }
 
-        // Add to active memtable
-        {
+        let put_effect = {
             let mut memtable = self.active_memtable.write().await;
             memtable
                 .put(key, value)
                 .await
-                .map_err(Self::convert_error)?;
-        }
+                .map_err(Self::convert_error)?
+        };
+
+        self.apply_put_key_count(key, put_effect)
+            .await
+            .map_err(Self::convert_error)?;
 
         // Add TTL
         #[cfg(feature = "ttl")]
@@ -2767,14 +2837,17 @@ impl StorageEngine for LsmTreeEngine {
             }
         }
 
-        // Write to memtable
-        {
+        let put_effect = {
             let mut memtable = self.active_memtable.write().await;
             memtable
                 .put(&prefixed_key, value)
                 .await
-                .map_err(Self::convert_error)?;
-        }
+                .map_err(Self::convert_error)?
+        };
+
+        self.apply_put_key_count(&prefixed_key, put_effect)
+            .await
+            .map_err(Self::convert_error)?;
 
         // Set TTL for the prefixed key
         #[cfg(feature = "ttl")]
@@ -3842,6 +3915,41 @@ mod tests {
         // Get statistics - just verify it doesn't panic
         let _stats = engine.stats().await.expect("Failed to get stats");
         // Note: specific operation counts may not be available in current stats structure
+    }
+
+    #[tokio::test]
+    async fn test_live_key_count() {
+        let (engine, _temp_dir) = create_test_engine().await;
+
+        assert_eq!(engine.count().await.expect("count"), 0);
+
+        engine
+            .put("a", &Value::String("1".to_string()))
+            .await
+            .expect("put a");
+        engine
+            .put("b", &Value::String("2".to_string()))
+            .await
+            .expect("put b");
+        assert_eq!(engine.count().await.expect("count"), 2);
+
+        engine
+            .put("a", &Value::String("updated".to_string()))
+            .await
+            .expect("update a");
+        assert_eq!(engine.count().await.expect("count"), 2);
+
+        engine.delete("b").await.expect("delete b");
+        assert_eq!(engine.count().await.expect("count"), 1);
+
+        engine.flush().await.expect("flush");
+        assert_eq!(engine.count().await.expect("count after flush"), 1);
+
+        engine
+            .put("c", &Value::String("3".to_string()))
+            .await
+            .expect("put c");
+        assert_eq!(engine.count().await.expect("count after sstable put"), 2);
     }
 
     #[tokio::test]

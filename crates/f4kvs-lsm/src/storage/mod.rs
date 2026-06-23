@@ -9,6 +9,6 @@ pub mod sstable;
 pub mod wal;
 
 pub use block_cache::{BlockCache, CacheStats, SharedBlockCache};
-pub use memtable::{Memtable, MemtableLookupResult};
+pub use memtable::{Memtable, MemtableLookupResult, PutEffect};
 pub use sstable::SSTable;
 pub use wal::{WALEntry, WALManager};
