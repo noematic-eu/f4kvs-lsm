@@ -215,6 +215,16 @@ pub enum CompactionPriority {
     SpaceOptimized,
 }
 
+/// WAL storage engine implementation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WalEngine {
+    /// Segment files with per-commit `sync_all` (current default)
+    #[default]
+    Segment,
+    /// Frame-oriented append with incremental `sync_data` per commit
+    Frame,
+}
+
 /// WAL sync mode for durability guarantees
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WalSyncMode {
@@ -234,6 +244,12 @@ pub enum WalSyncMode {
 pub struct WalConfig {
     /// Enable WAL
     pub enabled: bool,
+
+    /// WAL backend implementation (`segment` or `frame`)
+    pub engine: WalEngine,
+
+    /// Frame page size in bytes (frame engine only)
+    pub frame_page_size: usize,
 
     /// WAL directory
     pub dir: PathBuf,
@@ -328,6 +344,8 @@ impl Default for WalConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            engine: WalEngine::Segment,
+            frame_page_size: 4096,
             dir: PathBuf::from("./f4kvs_lsm_wal"),
             segment_size: 64 * 1024 * 1024,             // 64MB
             buffer_size: 1024 * 1024,                   // 1MB

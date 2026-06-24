@@ -11,7 +11,7 @@ use crate::{
     compaction::CompactionManager,
     error::{LsmError, Result},
     storage::{
-        Memtable, MemtableLookupResult, PutEffect, SSTable, SharedBlockCache, WALEntry, WALManager,
+        Memtable, MemtableLookupResult, PutEffect, SSTable, SharedBlockCache, WALEntry, WalHandle,
     },
     utils,
     utils::LsmStats,
@@ -63,8 +63,8 @@ pub struct LsmTreeEngine {
     /// SSTables organized by level
     sstables: Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
 
-    /// Write-ahead log manager
-    wal_manager: Arc<RwLock<WALManager>>,
+    /// Write-ahead log manager (segment or frame backend)
+    wal_manager: Arc<RwLock<WalHandle>>,
 
     /// Statistics
     stats: Arc<RwLock<LsmStats>>,
@@ -146,7 +146,7 @@ impl LsmTreeEngine {
         let immutable_memtables = Arc::new(RwLock::new(Vec::new()));
         let sstables = Arc::new(RwLock::new(HashMap::new()));
 
-        let wal_manager = Arc::new(RwLock::new(WALManager::new(&config.wal)?));
+        let wal_manager = Arc::new(RwLock::new(WalHandle::new(&config.wal)?));
         let stats = Arc::new(RwLock::new(LsmStats::default()));
         let column_families = Arc::new(RwLock::new(HashMap::new()));
 
@@ -277,13 +277,15 @@ impl LsmTreeEngine {
     async fn initialize_wal(&self) -> Result<()> {
         if self.config.wal.enabled {
             info!("WAL is enabled, initializing...");
-            let wal = self.wal_manager.write().await;
-            wal.initialize()
-                .await
-                .map_err(|e| LsmError::Wal(format!("Failed to initialize WAL: {}", e)))?;
+            {
+                let wal = self.wal_manager.write().await;
+                wal.initialize()
+                    .await
+                    .map_err(|e| LsmError::Wal(format!("Failed to initialize WAL: {}", e)))?;
+            }
             info!("WAL initialized, attempting recovery...");
 
-            // Recover from WAL on startup
+            // Recover from WAL on startup (must not hold wal write lock — recovery reads wal)
             // CRITICAL: WAL recovery failures must prevent startup unless explicitly allowed
             match self.recover_from_wal().await {
                 Ok(()) => {
@@ -426,176 +428,17 @@ impl LsmTreeEngine {
         }
 
         // Use a timeout to prevent infinite loops
+        let wal_engine = self.config.wal.engine;
         let recovery_result =
             tokio::time::timeout(self.config.wal.recovery_timeout, async {
-                // Scan WAL directory for all segment files
-                let mut all_entries = Vec::new();
-                let mut segments_found = 0;
-                let mut segments_read_successfully = 0;
-                let mut segments_with_errors = Vec::new();
-                let mut successful_segment_ids = Vec::new();
-                let mut failed_segment_ids = Vec::new();
-
-                if let Ok(entries) = std::fs::read_dir(wal_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if file_name.ends_with(".wal") && file_name.starts_with("segment_") {
-                                segments_found += 1;
-                                debug!("Found WAL segment file: {:?}", path);
-
-                                // Extract segment ID for tracking
-                                let segment_id = if let Some(id_str) = file_name
-                                    .strip_prefix("segment_")
-                                    .and_then(|s| s.strip_suffix(".wal"))
-                                {
-                                    u64::from_str_radix(id_str, 16).ok()
-                                } else {
-                                    None
-                                };
-
-                                // Try to read entries from this segment
-                                match crate::storage::wal::WALSegment::open_for_reading(
-                                    path.clone(),
-                                    self.config.wal.segment_size as u64,
-                                    self.config.wal.sync_mode,
-                                )
-                                .await
-                                {
-                                    Ok(mut segment) => match segment.read_entries().await {
-                                        Ok(entries) => {
-                                            debug!(
-                                                "Read {} entries from segment {:?}",
-                                                entries.len(),
-                                                path
-                                            );
-                                            all_entries.extend(entries);
-                                            segments_read_successfully += 1;
-                                            if let Some(id) = segment_id {
-                                                successful_segment_ids.push(id);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to read entries from segment {:?}: {}",
-                                                path, e
-                                            );
-                                            segments_with_errors
-                                                .push((path.clone(), format!("Read error: {}", e)));
-                                            if let Some(id) = segment_id {
-                                                failed_segment_ids.push(id);
-                                            }
-                                        }
-                                    },
-                                    Err(e) => {
-                                        debug!("Failed to open segment {:?}: {}", path, e);
-                                        segments_with_errors
-                                            .push((path.clone(), format!("Open error: {}", e)));
-                                        if let Some(id) = segment_id {
-                                            failed_segment_ids.push(id);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Sort by timestamp
-                all_entries.sort_by(|a, b| {
-                    let timestamp_a = match a {
-                        crate::storage::wal::WALEntry::Put { timestamp, .. } => {
-                            *timestamp
-                        }
-                        crate::storage::wal::WALEntry::Delete { timestamp, .. } => {
-                            *timestamp
-                        }
-                        crate::storage::wal::WALEntry::Flush { timestamp, .. } => {
-                            *timestamp
-                        }
-                        crate::storage::wal::WALEntry::Checkpoint {
-                            timestamp, ..
-                        } => *timestamp,
-                    };
-                    let timestamp_b = match b {
-                        crate::storage::wal::WALEntry::Put { timestamp, .. } => {
-                            *timestamp
-                        }
-                        crate::storage::wal::WALEntry::Delete { timestamp, .. } => {
-                            *timestamp
-                        }
-                        crate::storage::wal::WALEntry::Flush { timestamp, .. } => {
-                            *timestamp
-                        }
-                        crate::storage::wal::WALEntry::Checkpoint {
-                            timestamp, ..
-                        } => *timestamp,
-                    };
-                    timestamp_a.cmp(&timestamp_b)
-                });
-
-                // If we found WAL segments but couldn't read any successfully, that's an error
-                // This indicates corrupted WAL files that cannot be recovered
-                if segments_found > 0 && segments_read_successfully == 0 {
-                    warn!(
-                        "WAL recovery failure detected: segments_found={}, segments_read_successfully={}, errors={:?}",
-                        segments_found, segments_read_successfully, segments_with_errors
-                    );
-                    return Err(LsmError::Wal(format!(
-                        "WAL recovery failed: Found {} WAL segment(s) but failed to read from all of them. \
-                        Segment errors: {:?}. \
-                        This indicates corrupted WAL files that cannot be recovered.",
-                        segments_found, segments_with_errors
-                    )));
-                }
-
-                // If we have failed segments and the only successful segment is a new empty one (highest ID),
-                // and all lower-ID segments failed, that indicates all pre-initialization segments are corrupted
-                // This ensures we fail when existing WAL files are corrupted, even if a new empty segment was created
-                if !failed_segment_ids.is_empty() && !successful_segment_ids.is_empty() {
-                    let max_successful_id = successful_segment_ids.iter().max().copied().unwrap_or(0);
-                    let max_failed_id = failed_segment_ids.iter().max().copied().unwrap_or(0);
-
-                    // If all failed segments have IDs less than the successful segments,
-                    // and we only have one successful segment (likely the new empty one),
-                    // then all pre-initialization segments failed
-                    if max_failed_id < max_successful_id && successful_segment_ids.len() == 1 {
-                        warn!(
-                            "WAL recovery failure detected: All pre-initialization segment(s) (IDs < {}) failed to read. Errors: {:?}",
-                            max_successful_id, segments_with_errors
-                        );
-                        return Err(LsmError::Wal(format!(
-                            "WAL recovery failed: All pre-initialization segment(s) failed to read. \
-                            Segment errors: {:?}. \
-                            Corrupted WAL files detected.",
-                            segments_with_errors
-                        )));
-                    }
-                }
-
-                // If we have corrupted segments but also have valid segments, log a warning but continue
-                // This allows recovery to proceed when some segments are corrupted but others are valid
-                // (e.g., data already flushed to SSTables, only recent WAL segments corrupted)
-                if !segments_with_errors.is_empty() && segments_read_successfully > 0 {
-                    warn!(
-                        "WAL recovery warning: {} segment(s) failed to read but {} segment(s) succeeded. \
-                        Continuing recovery with available segments. Errors: {:?}",
-                        segments_with_errors.len(), segments_read_successfully, segments_with_errors
-                    );
-                }
-
-                // Log recovery summary for debugging
-                if segments_found > 0 {
-                    info!(
-                        "WAL recovery summary: found {} segment(s), successfully read {} segment(s)",
-                        segments_found, segments_read_successfully
-                    );
-                }
-
-                Ok::<
-                    Vec<crate::storage::wal::WALEntry>,
-                    crate::error::LsmError,
-                >(all_entries)
+                let wal = self.wal_manager.read().await;
+                let all_entries = wal.read_entries_for_recovery().await?;
+                info!(
+                    "WAL recovery: read {} entries ({:?} engine)",
+                    all_entries.len(),
+                    wal_engine
+                );
+                Ok::<Vec<WALEntry>, LsmError>(all_entries)
             })
             .await;
 
@@ -3032,7 +2875,7 @@ impl std::fmt::Debug for LsmTreeEngine {
             .field("active_memtable", &"Arc<RwLock<Memtable>>")
             .field("immutable_memtables", &"Arc<RwLock<Vec<Memtable>>>")
             .field("sstables", &"Arc<RwLock<HashMap<usize, Vec<SSTable>>>>")
-            .field("wal_manager", &"Arc<RwLock<WALManager>>")
+            .field("wal_manager", &"Arc<RwLock<WalHandle>>")
             .field("stats", &"Arc<RwLock<LsmStats>>")
             .field("column_families", &"Arc<RwLock<HashMap<String, usize>>>")
             .finish()

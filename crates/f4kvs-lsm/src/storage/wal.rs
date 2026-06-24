@@ -850,6 +850,45 @@ impl WALManager {
         Ok(true)
     }
 
+    /// Read all entries from WAL files on disk (startup recovery).
+    pub async fn read_entries_from_disk(&self) -> Result<Vec<WALEntry>> {
+        let mut all_entries = Vec::new();
+        if !self.wal_dir.exists() {
+            return Ok(all_entries);
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&self.wal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !file_name.ends_with(".wal") || !file_name.starts_with("segment_") {
+                    continue;
+                }
+                if let Ok(mut segment) = WALSegment::open_for_reading(
+                    path,
+                    self.config.segment_size as u64,
+                    self.config.sync_mode,
+                )
+                .await
+                {
+                    if let Ok(entries) = segment.read_entries().await {
+                        all_entries.extend(entries);
+                    }
+                }
+            }
+        }
+
+        all_entries.sort_by_key(|e| match e {
+            WALEntry::Put { timestamp, .. }
+            | WALEntry::Delete { timestamp, .. }
+            | WALEntry::Flush { timestamp, .. }
+            | WALEntry::Checkpoint { timestamp, .. } => *timestamp,
+        });
+        Ok(all_entries)
+    }
+
     /// Read WAL entries from all segments
     pub async fn read_entries(&self) -> Result<Vec<WALEntry>> {
         let mut all_entries = Vec::new();

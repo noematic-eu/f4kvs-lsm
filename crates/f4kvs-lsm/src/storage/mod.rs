@@ -7,8 +7,11 @@ pub mod block_cache;
 pub mod memtable;
 pub mod sstable;
 pub mod wal;
+pub mod wal_frame;
+pub mod wal_handle;
 
 pub use block_cache::{BlockCache, BlockCacheMetrics, CacheStats, SharedBlockCache};
 pub use memtable::{Memtable, MemtableLookupResult, PutEffect};
 pub use sstable::SSTable;
 pub use wal::{WALEntry, WALManager};
+pub use wal_handle::WalHandle;
