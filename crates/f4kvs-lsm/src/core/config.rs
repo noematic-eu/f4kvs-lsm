@@ -294,6 +294,34 @@ pub struct WalConfig {
     ///
     /// Default: `30` seconds (reasonable for most use cases)
     pub recovery_timeout: Duration,
+
+    /// Enable group commit for single `put`/`delete` operations.
+    ///
+    /// When enabled, WAL entries are buffered and flushed on a time window and/or
+    /// batch size threshold, amortizing `fsync` cost. `batch_put` still performs
+    /// explicit batch writes and flushes any pending group-commit queue first.
+    ///
+    /// Default: `false` (strict per-operation fsync when `sync_mode = Fsync`)
+    pub group_commit_enabled: bool,
+
+    /// Maximum time to hold buffered WAL entries before flushing (group commit).
+    ///
+    /// Default: `10` ms
+    pub group_commit_max_wait: Duration,
+
+    /// Maximum buffered entries before forcing a group-commit flush.
+    ///
+    /// Default: `1000`
+    pub group_commit_max_batch_size: usize,
+
+    /// When `true`, `put`/`delete` return after the entry is flushed in a group-commit
+    /// batch (strict per-call durability within the group-commit window).
+    ///
+    /// When `false`, calls return after enqueue; entries become durable within
+    /// `group_commit_max_wait` (higher throughput for sequential writers).
+    ///
+    /// Default: `false`
+    pub group_commit_wait_durable: bool,
 }
 
 impl Default for WalConfig {
@@ -312,6 +340,10 @@ impl Default for WalConfig {
             max_segments: 10,                            // 10 segments
             allow_recovery_failure: false,               // Default: recovery failures block startup
             recovery_timeout: Duration::from_secs(30),   // 30 seconds
+            group_commit_enabled: false,
+            group_commit_max_wait: Duration::from_millis(10),
+            group_commit_max_batch_size: 1000,
+            group_commit_wait_durable: false,
         }
     }
 }
@@ -522,6 +554,18 @@ impl LsmConfig {
             if self.wal.buffer_size == 0 {
                 errors
                     .push("wal.buffer_size must be greater than 0 when WAL is enabled".to_string());
+            }
+            if self.wal.group_commit_enabled && self.wal.group_commit_max_batch_size == 0 {
+                errors.push(
+                    "wal.group_commit_max_batch_size must be greater than 0 when group commit is enabled"
+                        .to_string(),
+                );
+            }
+            if self.wal.group_commit_enabled && self.wal.group_commit_max_wait.is_zero() {
+                errors.push(
+                    "wal.group_commit_max_wait must be greater than 0 when group commit is enabled"
+                        .to_string(),
+                );
             }
         }
 

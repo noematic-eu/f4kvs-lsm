@@ -354,11 +354,64 @@ impl WALSegment {
     }
 }
 
-/// Group commit batch for efficient WAL writes
-#[derive(Debug)]
-struct GroupCommitBatch {
-    entries: Vec<WALEntry>,
-    notify: Arc<Notify>,
+/// Pending WAL entry waiting for group-commit flush.
+struct PendingGroupCommitEntry {
+    entry: WALEntry,
+    ack: tokio::sync::oneshot::Sender<Result<()>>,
+}
+
+/// Buffered WAL entries for group commit.
+struct GroupCommitQueue {
+    pending: Vec<PendingGroupCommitEntry>,
+}
+
+/// Background group-commit flusher (time/size triggered).
+struct GroupCommitFlusher {
+    queue: Arc<Mutex<GroupCommitQueue>>,
+    commit_notify: Arc<Notify>,
+    current_segment: Arc<RwLock<Option<WALSegment>>>,
+    segments: Arc<RwLock<HashMap<u64, PathBuf>>>,
+    segment_counter: Arc<std::sync::atomic::AtomicU64>,
+    wal_dir: PathBuf,
+    config: WalConfig,
+}
+
+impl GroupCommitFlusher {
+    async fn flush_pending(&self) -> Result<()> {
+        let pending = {
+            let mut guard = self.queue.lock().await;
+            std::mem::take(&mut guard.pending)
+        };
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let entries: Vec<WALEntry> = pending.iter().map(|p| p.entry.clone()).collect();
+        let manager = WALManager {
+            config: self.config.clone(),
+            current_segment: self.current_segment.clone(),
+            segments: self.segments.clone(),
+            segment_counter: self.segment_counter.clone(),
+            wal_dir: self.wal_dir.clone(),
+            group_commit_queue: Arc::new(Mutex::new(GroupCommitQueue {
+                pending: Vec::new(),
+            })),
+            commit_notify: Arc::new(Notify::new()),
+            commit_task: Arc::new(Mutex::new(None)),
+        };
+        let flush_result = manager.batch_write_entries(&entries).await;
+
+        for waiter in pending {
+            let ack_result = flush_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| LsmError::Internal(e.to_string()));
+            let _ = waiter.ack.send(ack_result);
+        }
+
+        flush_result
+    }
 }
 
 /// WAL manager with group commit support
@@ -370,11 +423,9 @@ pub struct WALManager {
     wal_dir: PathBuf,
 
     // Group commit fields
-    pending_batch: Arc<Mutex<Option<GroupCommitBatch>>>,
+    group_commit_queue: Arc<Mutex<GroupCommitQueue>>,
     commit_notify: Arc<Notify>,
-    max_batch_size: usize,
-    max_batch_wait: Duration,
-    commit_task: Option<tokio::task::JoinHandle<()>>,
+    commit_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl WALManager {
@@ -386,12 +437,16 @@ impl WALManager {
             segments: Arc::new(RwLock::new(HashMap::new())),
             segment_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal_dir: PathBuf::from(&config.dir),
-            pending_batch: Arc::new(Mutex::new(None)),
+            group_commit_queue: Arc::new(Mutex::new(GroupCommitQueue {
+                pending: Vec::new(),
+            })),
             commit_notify: Arc::new(Notify::new()),
-            max_batch_size: 1000,                      // Default batch size
-            max_batch_wait: Duration::from_millis(10), // 10ms max wait
-            commit_task: None,
+            commit_task: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn group_commit_enabled(&self) -> bool {
+        self.config.group_commit_enabled
     }
 
     /// Initialize WAL (create first segment)
@@ -406,6 +461,11 @@ impl WALManager {
         // Check for existing segments and set counter appropriately
         self.scan_existing_segments().await?;
         self.rotate_segment().await?;
+
+        if self.group_commit_enabled() {
+            self.start_group_commit().await?;
+        }
+
         Ok(())
     }
 
@@ -499,7 +559,11 @@ impl WALManager {
             timestamp: utils::timestamp_secs(),
         };
 
-        self.write_entry(&entry).await
+        if self.group_commit_enabled() {
+            self.write_entry_group_commit(entry).await
+        } else {
+            self.write_entry(&entry).await
+        }
     }
 
     /// Write a delete operation to WAL
@@ -511,8 +575,11 @@ impl WALManager {
             timestamp,
         };
 
-        // Debug logging removed for performance
-        self.write_entry(&entry).await
+        if self.group_commit_enabled() {
+            self.write_entry_group_commit(entry).await
+        } else {
+            self.write_entry(&entry).await
+        }
     }
 
     /// Write a WAL entry
@@ -556,6 +623,10 @@ impl WALManager {
 
     /// Flush WAL to disk
     pub async fn flush(&self) -> Result<()> {
+        if self.group_commit_enabled() {
+            self.flush_pending_group_commit().await?;
+        }
+
         let mut current_segment = self.current_segment.write().await;
         if let Some(segment) = current_segment.as_mut() {
             // Flush the current segment to disk
@@ -982,6 +1053,10 @@ impl WALManager {
             return Ok(());
         }
 
+        if self.group_commit_enabled() {
+            self.flush_pending_group_commit().await?;
+        }
+
         let timestamp = utils::timestamp_secs();
         // Debug logging removed for performance
 
@@ -1136,144 +1211,105 @@ impl WALManager {
     }
 
     /// Start the group commit background task
-    pub async fn start_group_commit(&mut self) -> Result<()> {
-        if self.commit_task.is_some() {
-            return Ok(()); // Already started
+    pub async fn start_group_commit(&self) -> Result<()> {
+        let mut task_guard = self.commit_task.lock().await;
+        if task_guard.is_some() {
+            return Ok(());
         }
 
-        let pending_batch = self.pending_batch.clone();
+        let queue = self.group_commit_queue.clone();
         let commit_notify = self.commit_notify.clone();
         let current_segment = self.current_segment.clone();
-        let _max_batch_size = self.max_batch_size;
-        let max_batch_wait = self.max_batch_wait;
+        let segments = self.segments.clone();
+        let segment_counter = self.segment_counter.clone();
+        let wal_dir = self.wal_dir.clone();
+        let config = self.config.clone();
+        let max_batch_wait = self.config.group_commit_max_wait;
 
         let commit_task = tokio::spawn(async move {
+            let manager = GroupCommitFlusher {
+                queue,
+                commit_notify,
+                current_segment,
+                segments,
+                segment_counter,
+                wal_dir,
+                config,
+            };
+
             let mut commit_interval = tokio::time::interval(max_batch_wait);
+            commit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
                     _ = commit_interval.tick() => {
-                        // Time-based commit
-                        Self::process_pending_batch(&pending_batch, &current_segment).await;
+                        if let Err(e) = manager.flush_pending().await {
+                            tracing::error!("Group commit time flush failed: {}", e);
+                        }
                     }
-                    _ = commit_notify.notified() => {
-                        // Notify-based commit
-                        Self::process_pending_batch(&pending_batch, &current_segment).await;
+                    _ = manager.commit_notify.notified() => {
+                        if let Err(e) = manager.flush_pending().await {
+                            tracing::error!("Group commit notify flush failed: {}", e);
+                        }
                     }
                 }
             }
         });
 
-        self.commit_task = Some(commit_task);
+        *task_guard = Some(commit_task);
         Ok(())
     }
 
-    /// Process pending batch for group commit
-    async fn process_pending_batch(
-        pending_batch: &Arc<Mutex<Option<GroupCommitBatch>>>,
-        current_segment: &Arc<RwLock<Option<WALSegment>>>,
-    ) {
-        let batch = {
-            let mut batch_guard = pending_batch.lock().await;
-            batch_guard.take()
+    /// Flush any buffered group-commit entries to WAL (one durable batch).
+    pub async fn flush_pending_group_commit(&self) -> Result<()> {
+        let pending = {
+            let mut guard = self.group_commit_queue.lock().await;
+            std::mem::take(&mut guard.pending)
         };
 
-        if let Some(batch) = batch {
-            // Write all entries in the batch
-            if let Err(e) = Self::write_batch_to_segment(current_segment, &batch.entries).await {
-                tracing::error!("Failed to write batch to WAL: {}", e);
-            }
-
-            // Notify all waiting writers
-            batch.notify.notify_waiters();
-        }
-    }
-
-    /// Write a batch of entries to the current segment
-    async fn write_batch_to_segment(
-        current_segment: &Arc<RwLock<Option<WALSegment>>>,
-        entries: &[WALEntry],
-    ) -> Result<()> {
-        if entries.is_empty() {
+        if pending.is_empty() {
             return Ok(());
         }
 
-        let mut segment_guard = current_segment.write().await;
-        let segment = segment_guard
-            .as_mut()
-            .ok_or_else(|| LsmError::Internal("No current WAL segment".to_string()))?;
+        let entries: Vec<WALEntry> = pending.iter().map(|p| p.entry.clone()).collect();
+        let flush_result = self.batch_write_entries(&entries).await;
 
-        // Serialize all entries
-        let mut data_to_write = Vec::new();
-        for entry in entries {
-            let entry_data = bincode::serialize(entry).map_err(|e| {
-                LsmError::Serialization(format!("Failed to serialize entry: {}", e))
-            })?;
-            let size = entry_data.len() as u32;
-            data_to_write.extend_from_slice(&size.to_le_bytes());
-            data_to_write.extend_from_slice(&entry_data);
+        for waiter in pending {
+            let ack_result = flush_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| LsmError::Internal(e.to_string()));
+            let _ = waiter.ack.send(ack_result);
         }
 
-        // Seek to end of file
-        segment
-            .file
-            .seek(tokio::io::SeekFrom::End(0))
-            .await
-            .map_err(LsmError::Io)?;
-
-        // Write all data in one go
-        segment
-            .file
-            .write_all(&data_to_write)
-            .await
-            .map_err(LsmError::Io)?;
-
-        // Update entry count
-        segment.entry_count += entries.len() as u32;
-        segment.header.entry_count = segment.entry_count;
-
-        // Update header
-        segment.write_header().await?;
-
-        // Single flush for the entire batch
-        segment.file.flush().await.map_err(LsmError::Io)?;
-
-        Ok(())
+        flush_result
     }
 
-    /// Add entry to group commit batch
+    /// Buffer a WAL entry for group commit; returns after the entry is durable.
     pub async fn write_entry_group_commit(&self, entry: WALEntry) -> Result<()> {
-        let notify = Arc::new(Notify::new());
-        let notify_clone = notify.clone();
-
-        // Try to add to existing batch or create new one
-        let should_commit = {
-            let mut batch_guard = self.pending_batch.lock().await;
-
-            match batch_guard.as_mut() {
-                Some(batch) => {
-                    batch.entries.push(entry);
-                    batch.entries.len() >= self.max_batch_size
-                }
-                None => {
-                    let batch = GroupCommitBatch {
-                        entries: vec![entry],
-                        notify: notify_clone,
-                    };
-                    *batch_guard = Some(batch);
-                    false
-                }
-            }
+        let (rx, should_flush_now) = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let mut guard = self.group_commit_queue.lock().await;
+            guard.pending.push(PendingGroupCommitEntry { entry, ack: tx });
+            let should_flush = guard.pending.len() >= self.config.group_commit_max_batch_size;
+            (rx, should_flush)
         };
 
-        if should_commit {
-            // Trigger immediate commit
+        if should_flush_now {
             self.commit_notify.notify_one();
         }
 
-        // Wait for commit to complete
-        notify.notified().await;
-        Ok(())
+        if !self.config.group_commit_wait_durable {
+            return Ok(());
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(LsmError::Internal(
+                "Group commit waiter dropped before flush".to_string(),
+            )),
+        }
     }
 
     /// Mark clean shutdown by writing a checkpoint and truncating
@@ -1287,6 +1323,10 @@ impl WALManager {
         };
 
         if has_current_segment {
+            if self.group_commit_enabled() {
+                self.flush_pending_group_commit().await?;
+            }
+
             // Write a checkpoint entry if there's an active segment
             let checkpoint_entry = WALEntry::Checkpoint {
                 timestamp: utils::timestamp_secs(),

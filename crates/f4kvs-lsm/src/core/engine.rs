@@ -3055,6 +3055,15 @@ impl Drop for LsmTreeEngine {
 }
 
 impl LsmTreeEngine {
+    /// Flush WAL buffers (including group-commit queue) without flushing memtable to SSTable.
+    pub async fn flush_wal(&self) -> Result<()> {
+        if self.config.wal.enabled {
+            let wal = self.wal_manager.read().await;
+            wal.flush().await?;
+        }
+        Ok(())
+    }
+
     /// Get LSM-specific statistics
     pub async fn lsm_stats(&self) -> Result<LsmStats> {
         let stats = self.stats.read().await;
@@ -3634,6 +3643,7 @@ impl KeyValueIterator for SimpleKeyValueIterator {
 mod tests {
     use super::*;
     use crate::core::config::*;
+    use std::time::Duration;
     use tempfile::TempDir;
     #[cfg(feature = "ttl")]
     use tokio::time::{sleep, Duration};
@@ -4011,6 +4021,54 @@ mod tests {
             .await
             .expect("Failed to get persistent value");
         assert_eq!(retrieved, Some(value));
+    }
+
+    #[tokio::test]
+    async fn test_wal_group_commit_persistence() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let data_dir = temp_dir.path().to_path_buf();
+        let mut config = LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                group_commit_enabled: true,
+                group_commit_max_wait: Duration::from_millis(10),
+                group_commit_max_batch_size: 32,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        };
+        config.data_dir = data_dir.clone();
+
+        let engine = LsmTreeEngine::new(config.clone())
+            .await
+            .expect("Failed to create group-commit engine");
+
+        for i in 0..64 {
+            engine
+                .put(
+                    &format!("gc_key_{i}"),
+                    &Value::Bytes(vec![b'x'; 256]),
+                )
+                .await
+                .expect("group commit put failed");
+        }
+
+        engine.flush().await.expect("flush failed");
+        engine.shutdown().await.expect("shutdown failed");
+
+        let recovered = LsmTreeEngine::new(config)
+            .await
+            .expect("Failed to reopen engine");
+        for i in 0..64 {
+            let value = recovered
+                .get(&format!("gc_key_{i}"))
+                .await
+                .expect("get failed");
+            assert!(value.is_some(), "missing gc_key_{i}");
+        }
     }
 
     #[tokio::test]
