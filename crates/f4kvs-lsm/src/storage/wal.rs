@@ -192,17 +192,20 @@ impl WALSegment {
             .await
             .map_err(LsmError::Io)?;
 
-        // Update counts
+        // Update counts (header persisted on flush/close/rotate, not per entry)
         self.entry_count += 1;
         self.header.entry_count = self.entry_count;
-
-        // Update header
-        self.write_header().await?;
 
         // Flush and sync based on sync_mode
         self.sync_after_flush().await?;
 
         Ok(true)
+    }
+
+    /// Persist the segment header and flush/sync to disk.
+    async fn sync_header_and_flush(&mut self) -> Result<()> {
+        self.write_header().await?;
+        self.sync_after_flush().await
     }
 
     /// Sync file to disk based on sync_mode
@@ -333,13 +336,15 @@ impl WALSegment {
     /// Close segment
     /// Flush the segment to disk
     pub async fn flush(&mut self) -> Result<()> {
-        self.sync_after_flush().await?;
+        self.sync_header_and_flush().await?;
         Ok(())
     }
 
     /// Close the WAL segment and flush any pending writes
     pub async fn close(&mut self) -> Result<()> {
         tracing::info!("WAL Segment: Closing segment: {:?}", self.path);
+
+        self.write_header().await?;
 
         // Sync all data to disk
         self.file.sync_all().await.map_err(LsmError::Io)?;
@@ -1101,11 +1106,8 @@ impl WALManager {
                 current_segment.entry_count
             );
 
-            // Update header
-            current_segment.write_header().await?;
-
-            // Flush and sync to disk
-            current_segment.sync_after_flush().await?;
+            // Update header and sync once for the whole batch
+            current_segment.sync_header_and_flush().await?;
         } else {
             // Write all data to current segment
             current_segment
@@ -1126,11 +1128,8 @@ impl WALManager {
                 current_segment.entry_count
             );
 
-            // Update header
-            current_segment.write_header().await?;
-
-            // Flush and sync to disk
-            current_segment.sync_after_flush().await?;
+            // Update header and sync once for the whole batch
+            current_segment.sync_header_and_flush().await?;
         }
 
         Ok(())
