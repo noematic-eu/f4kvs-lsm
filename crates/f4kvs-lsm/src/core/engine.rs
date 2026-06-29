@@ -1476,21 +1476,17 @@ impl LsmTreeEngine {
 #[async_trait]
 impl StorageEngine for LsmTreeEngine {
     async fn put(&self, key: &str, value: &Value) -> std::result::Result<(), F4KvsError> {
-        // Acquire read lock to prevent compaction during write
-        let _op_guard = self.operation_guard.read().await;
+        let put_effect = {
+            // Hold operation guard only for WAL + memtable write, not for flush.
+            let _op_guard = self.operation_guard.read().await;
 
-        // Write to WAL first (if enabled)
-        if self.config.wal.enabled {
-            {
+            if self.config.wal.enabled {
                 let wal = self.wal_manager.write().await;
                 wal.write_operation(key, value)
                     .await
                     .map_err(Self::convert_error)?;
             }
-        }
 
-        // Add to active memtable
-        let put_effect = {
             let mut memtable = self.active_memtable.write().await;
             memtable
                 .put(key, value)
@@ -1502,14 +1498,12 @@ impl StorageEngine for LsmTreeEngine {
             .await
             .map_err(Self::convert_error)?;
 
-        // Update statistics
         {
             let mut stats = self.stats.write().await;
             stats.total_writes += 1;
             stats.total_bytes_written += key.len() as u64 + Self::estimate_value_size(value) as u64;
         }
 
-        // Check if we need to flush memtable
         self.check_memtable_flush()
             .await
             .map_err(Self::convert_error)?;
@@ -1603,21 +1597,16 @@ impl StorageEngine for LsmTreeEngine {
     }
 
     async fn delete(&self, key: &str) -> std::result::Result<(), F4KvsError> {
-        // Acquire read lock to prevent compaction during delete
-        let _op_guard = self.operation_guard.read().await;
-
         let was_live = self.exists(key).await?;
 
-        // Write tombstone to WAL
-        if self.config.wal.enabled {
-            {
+        {
+            let _op_guard = self.operation_guard.read().await;
+
+            if self.config.wal.enabled {
                 let wal = self.wal_manager.write().await;
                 wal.write_delete(key).await.map_err(Self::convert_error)?;
             }
-        }
 
-        // Add tombstone to active memtable
-        {
             let mut memtable = self.active_memtable.write().await;
             memtable.delete(key).await.map_err(Self::convert_error)?;
         }
@@ -1628,19 +1617,16 @@ impl StorageEngine for LsmTreeEngine {
             stats.total_keys = self.live_key_count.load(Ordering::Relaxed);
         }
 
-        // Remove TTL if it exists
         #[cfg(feature = "ttl")]
         {
             let _ = self.ttl_manager.remove_ttl(key);
         }
 
-        // Update statistics
         {
             let mut stats = self.stats.write().await;
             stats.total_deletes += 1;
         }
 
-        // Check if we need to flush memtable
         self.check_memtable_flush()
             .await
             .map_err(Self::convert_error)?;
@@ -1686,10 +1672,6 @@ impl StorageEngine for LsmTreeEngine {
     }
 
     async fn batch_put(&self, items: Vec<(String, Value)>) -> std::result::Result<(), F4KvsError> {
-        // Acquire read lock to prevent compaction during batch write
-        let _op_guard = self.operation_guard.read().await;
-
-        // DoS protection: Enforce maximum batch size
         if items.len() > self.config.performance.max_batch_size {
             return Err(F4KvsError::Storage {
                 message: format!(
@@ -1700,36 +1682,38 @@ impl StorageEngine for LsmTreeEngine {
             });
         }
 
-        // Write to WAL first
-        if self.config.wal.enabled {
-            let wal = self.wal_manager.write().await;
-            wal.batch_write_operations(&items)
-                .await
-                .map_err(Self::convert_error)?;
-        }
-
         let put_effects: Vec<(String, PutEffect)> = {
-            let mut memtable = self.active_memtable.write().await;
+            let _op_guard = self.operation_guard.read().await;
+
+            if self.config.wal.enabled {
+                let wal = self.wal_manager.write().await;
+                wal.batch_write_operations(&items)
+                    .await
+                    .map_err(Self::convert_error)?;
+            }
+
             let mut effects = Vec::with_capacity(items.len());
             for (key, value) in &items {
-                let effect = memtable.put(key, value).await.map_err(Self::convert_error)?;
+                let effect = {
+                    let mut memtable = self.active_memtable.write().await;
+                    memtable.put(key, value).await.map_err(Self::convert_error)?
+                };
                 effects.push((key.clone(), effect));
             }
             effects
         };
+
         for (key, effect) in put_effects {
             self.apply_put_key_count(&key, effect)
                 .await
                 .map_err(Self::convert_error)?;
         }
 
-        // Update statistics
         {
             let mut stats = self.stats.write().await;
             stats.total_writes += items.len() as u64;
         }
 
-        // Check if we need to flush memtable
         self.check_memtable_flush()
             .await
             .map_err(Self::convert_error)?;
@@ -3578,6 +3562,65 @@ mod tests {
         runtime_handle()
             .block_on(async move { engine.batch_put(items).await })
             .expect("batch put");
+    }
+
+    /// Single tokio worker + group_commit_wait_durable can deadlock: puts await WAL ack
+    /// while the group-commit task cannot run on the only worker blocked in block_on.
+    #[test]
+    fn test_single_worker_group_commit_wait_durable_no_deadlock() {
+        use std::sync::{mpsc, OnceLock};
+        use tokio::runtime::Handle;
+
+        fn single_worker_handle() -> &'static Handle {
+            static HANDLE: OnceLock<Handle> = OnceLock::new();
+            HANDLE.get_or_init(|| {
+                let (tx, rx) = mpsc::sync_channel(1);
+                std::thread::Builder::new()
+                    .name("test-single-worker".into())
+                    .spawn(move || {
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(1)
+                            .enable_all()
+                            .build()
+                            .expect("runtime");
+                        tx.send(rt.handle().clone()).expect("handle");
+                        rt.block_on(std::future::pending::<()>());
+                    })
+                    .expect("spawn");
+                rx.recv().expect("handle")
+            })
+        }
+
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut config = LsmConfig::default();
+        config.data_dir = temp_dir.path().to_path_buf();
+        config.wal.dir = temp_dir.path().join("wal");
+        config.wal.group_commit_enabled = true;
+        config.wal.group_commit_wait_durable = true;
+        config.compaction.background_enabled = false;
+
+        let handle = single_worker_handle();
+        let engine = handle
+            .block_on(async move {
+                tokio::time::timeout(Duration::from_secs(10), LsmTreeEngine::new(config)).await
+            })
+            .expect("timeout")
+            .expect("engine new");
+
+        for i in 0..128 {
+            let key = format!("gc_single_worker_{i}");
+            let result = handle.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    engine.put(&key, &Value::String("v".into())),
+                )
+                .await
+            });
+            match result {
+                Ok(Ok(())) => {}
+                _ => panic!("deadlock or failure at put {i}: {result:?}"),
+            }
+        }
     }
 
     #[tokio::test]
