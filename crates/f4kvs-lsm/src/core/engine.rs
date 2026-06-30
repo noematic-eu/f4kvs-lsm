@@ -100,6 +100,9 @@ pub struct LsmTreeEngine {
     /// Live key count (O(1) `count()`); rebuilt on open, maintained incrementally on writes/deletes.
     live_key_count: AtomicU64,
 
+    /// Bulk import mode: skip per-key SSTable lookups when maintaining live key count.
+    bulk_import: AtomicBool,
+
     /// Shared LRU cache for SSTable entry blocks (avoids repeated disk reads on hot keys).
     block_cache: SharedBlockCache,
 }
@@ -188,8 +191,14 @@ impl LsmTreeEngine {
             sequence_number: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             operation_guard: Arc::new(RwLock::new(())),
             live_key_count: AtomicU64::new(0),
+            bulk_import: AtomicBool::new(false),
             block_cache,
         })
+    }
+
+    /// Enable bulk import mode (vault tree load). Skips O(L0) SSTable probes per inserted key.
+    pub fn set_bulk_import(&self, enabled: bool) {
+        self.bulk_import.store(enabled, Ordering::Relaxed);
     }
 
     fn set_live_key_count(&self, count: u64) {
@@ -225,7 +234,9 @@ impl LsmTreeEngine {
             PutEffect::UpdatedLive => 0,
             PutEffect::Resurrected => 1,
             PutEffect::Inserted => {
-                if self.get_from_sstables(key).await?.is_some() {
+                if self.bulk_import.load(Ordering::Relaxed) {
+                    1
+                } else if self.get_from_sstables(key).await?.is_some() {
                     0
                 } else {
                     1
@@ -236,6 +247,28 @@ impl LsmTreeEngine {
             self.adjust_live_key_count(delta);
             let mut stats = self.stats.write().await;
             stats.total_keys = self.live_key_count.load(Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    async fn batch_apply_put_key_counts(&self, effects: &[(String, PutEffect)]) -> Result<()> {
+        if self.bulk_import.load(Ordering::Relaxed) {
+            let delta: i64 = effects
+                .iter()
+                .map(|(_, effect)| match effect {
+                    PutEffect::Inserted | PutEffect::Resurrected => 1,
+                    PutEffect::UpdatedLive => 0,
+                })
+                .sum();
+            if delta != 0 {
+                self.adjust_live_key_count(delta);
+                let mut stats = self.stats.write().await;
+                stats.total_keys = self.live_key_count.load(Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        for (key, effect) in effects {
+            self.apply_put_key_count(key, *effect).await?;
         }
         Ok(())
     }
@@ -1703,11 +1736,9 @@ impl StorageEngine for LsmTreeEngine {
             effects
         };
 
-        for (key, effect) in put_effects {
-            self.apply_put_key_count(&key, effect)
-                .await
-                .map_err(Self::convert_error)?;
-        }
+        self.batch_apply_put_key_counts(&put_effects)
+            .await
+            .map_err(Self::convert_error)?;
 
         {
             let mut stats = self.stats.write().await;
