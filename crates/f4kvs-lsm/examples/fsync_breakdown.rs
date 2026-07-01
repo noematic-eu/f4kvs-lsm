@@ -1,5 +1,5 @@
 //! Isolate per-put cost: memtable-only, WAL without fsync, WAL+fsync, raw append+fsync.
-use f4kvs_lsm::core::config::WalSyncMode;
+use f4kvs_lsm::core::config::{WalEngine, WalSyncMode};
 use f4kvs_lsm::{LsmConfig, LsmTreeEngine};
 use f4kvs_storage_core::traits::StorageEngine;
 use f4kvs_value::Value;
@@ -24,11 +24,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("fsync_breakdown: n={n} chunk_bytes={chunk_bytes} approx_wal_entry_bytes={wal_entry_bytes}\n");
 
+    fn isolated_cfg(dir: &tempfile::TempDir) -> LsmConfig {
+        let mut cfg = LsmConfig::default();
+        cfg.data_dir = dir.path().to_path_buf();
+        cfg.wal.dir = dir.path().join("wal");
+        cfg
+    }
+
     // memtable only (WAL disabled)
     {
         let dir = tempfile::tempdir()?;
-        let mut cfg = LsmConfig::default();
-        cfg.data_dir = dir.path().to_path_buf();
+        let mut cfg = isolated_cfg(&dir);
         cfg.wal.enabled = false;
         let engine = LsmTreeEngine::new(cfg).await?;
         let t0 = Instant::now();
@@ -42,8 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // WAL sync None
     {
         let dir = tempfile::tempdir()?;
-        let mut cfg = LsmConfig::default();
-        cfg.data_dir = dir.path().to_path_buf();
+        let mut cfg = isolated_cfg(&dir);
         cfg.wal.sync_mode = WalSyncMode::None;
         let engine = LsmTreeEngine::new(cfg).await?;
         let t0 = Instant::now();
@@ -57,8 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // WAL sync Flush (no fsync)
     {
         let dir = tempfile::tempdir()?;
-        let mut cfg = LsmConfig::default();
-        cfg.data_dir = dir.path().to_path_buf();
+        let mut cfg = isolated_cfg(&dir);
         cfg.wal.sync_mode = WalSyncMode::Flush;
         let engine = LsmTreeEngine::new(cfg).await?;
         let t0 = Instant::now();
@@ -69,20 +73,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("wal_sync_flush:           {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
     }
 
-    // default Fsync
+    // default Fsync (segment WAL)
     {
         let dir = tempfile::tempdir()?;
-        let engine = LsmTreeEngine::new(LsmConfig {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        })
-        .await?;
+        let engine = LsmTreeEngine::new(isolated_cfg(&dir)).await?;
         let t0 = Instant::now();
         for key in &keys {
             engine.put(key, &payload).await?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("wal_sync_fsync (default): {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!("wal_sync_fsync (segment): {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+    }
+
+    // WAL v2 indexed (per-frame micro-files)
+    {
+        let dir = tempfile::tempdir()?;
+        let mut cfg = isolated_cfg(&dir);
+        cfg.wal.engine = WalEngine::Indexed;
+        cfg.wal.indexed_frame_count = 4096;
+        let engine = LsmTreeEngine::new(cfg).await?;
+        let t0 = Instant::now();
+        for key in &keys {
+            engine.put(key, &payload).await?;
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("wal_sync_fsync (indexed): {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
     }
 
     // raw append + fsync (no bincode/LSM)

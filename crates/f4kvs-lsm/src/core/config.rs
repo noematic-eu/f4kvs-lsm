@@ -223,6 +223,8 @@ pub enum WalEngine {
     Segment,
     /// Frame-oriented append with incremental `sync_data` per commit
     Frame,
+    /// WAL v2 — pre-allocated frames + `wal.idx` durable watermark
+    Indexed,
 }
 
 /// WAL sync mode for durability guarantees
@@ -248,8 +250,11 @@ pub struct WalConfig {
     /// WAL backend implementation (`segment` or `frame`)
     pub engine: WalEngine,
 
-    /// Frame page size in bytes (frame engine only)
+    /// Frame page size in bytes (frame / indexed engines)
     pub frame_page_size: usize,
+
+    /// Data frame slots per indexed WAL segment (frame 0 is file header).
+    pub indexed_frame_count: u32,
 
     /// WAL directory
     pub dir: PathBuf,
@@ -346,6 +351,7 @@ impl Default for WalConfig {
             enabled: true,
             engine: WalEngine::Segment,
             frame_page_size: 4096,
+            indexed_frame_count: 4096,
             dir: PathBuf::from("./f4kvs_lsm_wal"),
             segment_size: 64 * 1024 * 1024,             // 64MB
             buffer_size: 1024 * 1024,                   // 1MB

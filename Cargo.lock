@@ -480,6 +480,7 @@ dependencies = [
  "dashmap",
  "f4kvs-storage-core",
  "f4kvs-value",
+ "libc",
  "log",
  "proptest",
  "rand 0.8.6",

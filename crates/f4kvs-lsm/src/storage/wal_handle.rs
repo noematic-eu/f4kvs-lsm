@@ -1,15 +1,17 @@
-//! Pluggable WAL backend — segment (default) or frame.
+//! Pluggable WAL backend — segment (default), frame, or indexed (v2).
 
 use crate::core::config::{WalConfig, WalEngine};
 use crate::error::Result;
 use crate::storage::wal::{WALEntry, WALManager};
 use crate::storage::wal_frame::FrameWalManager;
+use crate::storage::wal_indexed::IndexedWalManager;
 use std::time::Duration;
 
 /// Unified WAL handle delegating to the configured backend.
 pub enum WalHandle {
     Segment(WALManager),
     Frame(FrameWalManager),
+    Indexed(IndexedWalManager),
 }
 
 impl WalHandle {
@@ -17,6 +19,7 @@ impl WalHandle {
         match config.engine {
             WalEngine::Segment => Ok(Self::Segment(WALManager::new(config)?)),
             WalEngine::Frame => Ok(Self::Frame(FrameWalManager::new(config)?)),
+            WalEngine::Indexed => Ok(Self::Indexed(IndexedWalManager::new(config)?)),
         }
     }
 
@@ -24,6 +27,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.initialize().await,
             Self::Frame(wal) => wal.initialize().await,
+            Self::Indexed(wal) => wal.initialize().await,
         }
     }
 
@@ -31,6 +35,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.write_operation(key, value).await,
             Self::Frame(wal) => wal.write_operation(key, value).await,
+            Self::Indexed(wal) => wal.write_operation(key, value).await,
         }
     }
 
@@ -38,6 +43,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.write_delete(key).await,
             Self::Frame(wal) => wal.write_delete(key).await,
+            Self::Indexed(wal) => wal.write_delete(key).await,
         }
     }
 
@@ -48,6 +54,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.batch_write_operations(items).await,
             Self::Frame(wal) => wal.batch_write_operations(items).await,
+            Self::Indexed(wal) => wal.batch_write_operations(items).await,
         }
     }
 
@@ -55,6 +62,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.flush().await,
             Self::Frame(wal) => wal.flush().await,
+            Self::Indexed(wal) => wal.flush().await,
         }
     }
 
@@ -62,6 +70,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.truncate_after_flush().await,
             Self::Frame(wal) => wal.truncate_after_flush().await,
+            Self::Indexed(wal) => wal.truncate_after_flush().await,
         }
     }
 
@@ -69,6 +78,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.verify_truncated().await,
             Self::Frame(wal) => wal.verify_truncated().await,
+            Self::Indexed(wal) => wal.verify_truncated().await,
         }
     }
 
@@ -76,6 +86,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.mark_clean_shutdown().await,
             Self::Frame(wal) => wal.mark_clean_shutdown().await,
+            Self::Indexed(wal) => wal.mark_clean_shutdown().await,
         }
     }
 
@@ -83,6 +94,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.cleanup_old_segments(retention_period).await,
             Self::Frame(wal) => wal.cleanup_old_segments(retention_period).await,
+            Self::Indexed(wal) => wal.cleanup_old_segments(retention_period).await,
         }
     }
 
@@ -90,6 +102,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.cleanup_flushed_segments(grace_period).await,
             Self::Frame(wal) => wal.cleanup_flushed_segments(grace_period).await,
+            Self::Indexed(wal) => wal.cleanup_flushed_segments(grace_period).await,
         }
     }
 
@@ -97,6 +110,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.force_cleanup().await,
             Self::Frame(wal) => wal.force_cleanup().await,
+            Self::Indexed(wal) => wal.force_cleanup().await,
         }
     }
 
@@ -104,6 +118,7 @@ impl WalHandle {
         match self {
             Self::Segment(wal) => wal.read_entries_from_disk().await,
             Self::Frame(wal) => wal.read_entries_from_disk().await,
+            Self::Indexed(wal) => wal.read_entries_from_disk().await,
         }
     }
 }
