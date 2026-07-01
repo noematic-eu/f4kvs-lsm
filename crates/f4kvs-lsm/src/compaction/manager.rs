@@ -1059,7 +1059,13 @@ impl CompactionManager {
             }
 
             if !cloned.is_open() {
-                cloned.open().await?;
+                // SSTables flushed in this session already have the index in memory; reopening
+                // from disk can fail checksum validation on large files while entry data is fine.
+                if cloned.is_ready() && cloned.index_size() > 0 {
+                    cloned.ensure_file_open().await?;
+                } else {
+                    cloned.open().await?;
+                }
                 // After opening, verify it's still ready
                 if !cloned.is_ready() {
                     return Err(crate::error::LsmError::Internal(format!(

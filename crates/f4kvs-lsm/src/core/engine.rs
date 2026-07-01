@@ -216,16 +216,35 @@ impl LsmTreeEngine {
         }
     }
 
-    /// Rebuild live key count from merged layers (startup / post-compaction).
+    /// Rebuild live key count from SSTable metadata + memtables (startup).
+    ///
+    /// Avoids a full merge scan on open — that made vault browse wait minutes on multi-million-key trees.
     async fn refresh_live_key_count(&self) -> Result<()> {
-        let pairs = self.merge_scan_prefix_with_values("").await?;
-        let count = pairs.len() as u64;
+        let mut count: u64 = 0;
+        {
+            let sstables = self.sstables.read().await;
+            for level_sstables in sstables.values() {
+                for sstable in level_sstables {
+                    count = count.saturating_add(sstable.metadata().entry_count as u64);
+                }
+            }
+        }
+        {
+            let active_memtable = self.active_memtable.read().await;
+            count = count.saturating_add(active_memtable.entry_count().await as u64);
+        }
+        {
+            let immutable_memtables = self.immutable_memtables.read().await;
+            for memtable in immutable_memtables.iter() {
+                count = count.saturating_add(memtable.entry_count().await as u64);
+            }
+        }
         self.set_live_key_count(count);
         {
             let mut stats = self.stats.write().await;
             stats.total_keys = count;
         }
-        debug!("Refreshed live key count: {}", count);
+        debug!("Refreshed live key count (metadata): {}", count);
         Ok(())
     }
 
