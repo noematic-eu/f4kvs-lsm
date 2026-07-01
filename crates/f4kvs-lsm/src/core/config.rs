@@ -343,6 +343,27 @@ pub struct WalConfig {
     ///
     /// Default: `false`
     pub group_commit_wait_durable: bool,
+
+    /// Flush buffered entries after this quiet period since the last enqueue.
+    ///
+    /// When `Some`, a pending queue is fsync'd once no new entries arrive for this
+    /// duration (even if `group_commit_max_wait` has not elapsed). `None` disables
+    /// idle flush; only max-wait and batch-size triggers apply.
+    ///
+    /// Default: `None`
+    pub group_commit_idle_flush: Option<Duration>,
+}
+
+/// High-level WAL durability preset for embed / FFI consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WalDurability {
+    /// Per-operation fsync (no group commit).
+    #[default]
+    Strict,
+    /// Group commit: fsync on timer, batch size, and optional idle flush.
+    Amortized,
+    /// WAL flush only — no fsync per put; caller must `flush_wal()` for durability.
+    Buffered,
 }
 
 impl Default for WalConfig {
@@ -368,6 +389,27 @@ impl Default for WalConfig {
             group_commit_max_wait: Duration::from_millis(10),
             group_commit_max_batch_size: 1000,
             group_commit_wait_durable: false,
+            group_commit_idle_flush: None,
+        }
+    }
+}
+
+impl WalDurability {
+    pub fn apply_to(&self, wal: &mut WalConfig) {
+        match self {
+            WalDurability::Strict => {
+                wal.group_commit_enabled = false;
+                wal.group_commit_idle_flush = None;
+            }
+            WalDurability::Amortized => {
+                wal.group_commit_enabled = true;
+                wal.sync_mode = WalSyncMode::FsyncAsync;
+            }
+            WalDurability::Buffered => {
+                wal.group_commit_enabled = false;
+                wal.group_commit_idle_flush = None;
+                wal.sync_mode = WalSyncMode::Flush;
+            }
         }
     }
 }

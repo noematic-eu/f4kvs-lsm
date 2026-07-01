@@ -363,6 +363,7 @@ struct PendingGroupCommitEntry {
 /// Buffered WAL entries for group commit.
 struct GroupCommitQueue {
     pending: Vec<PendingGroupCommitEntry>,
+    timing: crate::storage::wal_group_commit::GroupCommitTiming,
 }
 
 /// Background group-commit flusher (time/size triggered).
@@ -380,7 +381,11 @@ impl GroupCommitFlusher {
     async fn flush_pending(&self) -> Result<()> {
         let pending = {
             let mut guard = self.queue.lock().await;
-            std::mem::take(&mut guard.pending)
+            let taken = std::mem::take(&mut guard.pending);
+            if !taken.is_empty() {
+                guard.timing.clear();
+            }
+            taken
         };
 
         if pending.is_empty() {
@@ -396,6 +401,7 @@ impl GroupCommitFlusher {
             wal_dir: self.wal_dir.clone(),
             group_commit_queue: Arc::new(Mutex::new(GroupCommitQueue {
                 pending: Vec::new(),
+                timing: crate::storage::wal_group_commit::GroupCommitTiming::default(),
             })),
             commit_notify: Arc::new(Notify::new()),
             commit_task: Arc::new(Mutex::new(None)),
@@ -439,6 +445,7 @@ impl WALManager {
             wal_dir: PathBuf::from(&config.dir),
             group_commit_queue: Arc::new(Mutex::new(GroupCommitQueue {
                 pending: Vec::new(),
+                timing: crate::storage::wal_group_commit::GroupCommitTiming::default(),
             })),
             commit_notify: Arc::new(Notify::new()),
             commit_task: Arc::new(Mutex::new(None)),
@@ -1264,11 +1271,12 @@ impl WALManager {
         let wal_dir = self.wal_dir.clone();
         let config = self.config.clone();
         let max_batch_wait = self.config.group_commit_max_wait;
+        let idle_flush = self.config.group_commit_idle_flush;
 
         let commit_task = tokio::spawn(async move {
             let manager = GroupCommitFlusher {
-                queue,
-                commit_notify,
+                queue: queue.clone(),
+                commit_notify: commit_notify.clone(),
                 current_segment,
                 segments,
                 segment_counter,
@@ -1276,20 +1284,35 @@ impl WALManager {
                 config,
             };
 
-            let mut commit_interval = tokio::time::interval(max_batch_wait);
-            commit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
             loop {
-                tokio::select! {
-                    _ = commit_interval.tick() => {
-                        if let Err(e) = manager.flush_pending().await {
-                            tracing::error!("Group commit time flush failed: {}", e);
+                let deadline = {
+                    let guard = queue.lock().await;
+                    crate::storage::wal_group_commit::next_flush_deadline(
+                        &guard.timing,
+                        guard.pending.len(),
+                        max_batch_wait,
+                        idle_flush,
+                    )
+                };
+
+                let mut flush_now = false;
+                if let Some(deadline) = deadline {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {
+                            flush_now = true;
+                        }
+                        _ = commit_notify.notified() => {
+                            let guard = queue.lock().await;
+                            flush_now = guard.pending.len() >= manager.config.group_commit_max_batch_size;
                         }
                     }
-                    _ = manager.commit_notify.notified() => {
-                        if let Err(e) = manager.flush_pending().await {
-                            tracing::error!("Group commit notify flush failed: {}", e);
-                        }
+                } else {
+                    commit_notify.notified().await;
+                }
+
+                if flush_now {
+                    if let Err(e) = manager.flush_pending().await {
+                        tracing::error!("Group commit flush failed: {}", e);
                     }
                 }
             }
@@ -1303,7 +1326,11 @@ impl WALManager {
     pub async fn flush_pending_group_commit(&self) -> Result<()> {
         let pending = {
             let mut guard = self.group_commit_queue.lock().await;
-            std::mem::take(&mut guard.pending)
+            let taken = std::mem::take(&mut guard.pending);
+            if !taken.is_empty() {
+                guard.timing.clear();
+            }
+            taken
         };
 
         if pending.is_empty() {
@@ -1326,17 +1353,17 @@ impl WALManager {
 
     /// Buffer a WAL entry for group commit; returns after the entry is durable.
     pub async fn write_entry_group_commit(&self, entry: WALEntry) -> Result<()> {
-        let (rx, should_flush_now) = {
+        let (rx, _batch_full) = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let mut guard = self.group_commit_queue.lock().await;
+            let was_empty = guard.pending.is_empty();
+            guard.timing.record_enqueue(was_empty);
             guard.pending.push(PendingGroupCommitEntry { entry, ack: tx });
-            let should_flush = guard.pending.len() >= self.config.group_commit_max_batch_size;
-            (rx, should_flush)
+            let batch_full = guard.pending.len() >= self.config.group_commit_max_batch_size;
+            (rx, batch_full)
         };
 
-        if should_flush_now {
-            self.commit_notify.notify_one();
-        }
+        self.commit_notify.notify_one();
 
         if !self.config.group_commit_wait_durable {
             return Ok(());

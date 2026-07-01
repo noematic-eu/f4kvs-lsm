@@ -10,6 +10,7 @@ pub mod wal;
 pub mod wal_frame;
 pub mod wal_handle;
 pub mod wal_index;
+pub mod wal_group_commit;
 pub mod wal_indexed;
 pub mod wal_sync;
 

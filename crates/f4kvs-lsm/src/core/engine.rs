@@ -3960,6 +3960,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_group_commit_idle_flush_persists() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let data_dir = temp_dir.path().to_path_buf();
+        let mut config = LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                group_commit_enabled: true,
+                group_commit_max_wait: Duration::from_secs(120),
+                group_commit_idle_flush: Some(Duration::from_millis(50)),
+                group_commit_max_batch_size: 10_000,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        };
+        config.data_dir = data_dir.clone();
+
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("Failed to create idle-flush engine");
+            engine
+                .put("idle-key", &Value::Bytes(vec![b'z'; 64]))
+                .await
+                .expect("put failed");
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            engine.shutdown().await.expect("shutdown failed");
+        }
+
+        let recovered = LsmTreeEngine::new(config)
+            .await
+            .expect("Failed to reopen engine");
+        assert!(
+            recovered.get("idle-key").await.expect("get failed").is_some(),
+            "idle flush should persist WAL before shutdown"
+        );
+    }
+
+    #[tokio::test]
     async fn test_wal_group_commit_persistence() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let data_dir = temp_dir.path().to_path_buf();
