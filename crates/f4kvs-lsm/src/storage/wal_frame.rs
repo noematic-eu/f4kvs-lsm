@@ -267,7 +267,6 @@ struct GroupCommitQueue {
 
 struct FrameGroupCommitFlusher {
     queue: Arc<Mutex<GroupCommitQueue>>,
-    commit_notify: Arc<Notify>,
     current_segment: Arc<RwLock<Option<FrameWalSegment>>>,
     segments: Arc<RwLock<HashMap<u64, PathBuf>>>,
     segment_counter: Arc<std::sync::atomic::AtomicU64>,
@@ -738,7 +737,6 @@ impl FrameWalManager {
         let commit_task = tokio::spawn(async move {
             let manager = FrameGroupCommitFlusher {
                 queue: queue.clone(),
-                commit_notify: commit_notify.clone(),
                 current_segment,
                 segments,
                 segment_counter,

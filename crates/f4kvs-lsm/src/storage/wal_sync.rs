@@ -75,6 +75,7 @@ fn sync_ranges_blocking(path: &Path, ranges: &[(u64, u64)]) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        use std::io;
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
         for &(offset, len) in ranges {
