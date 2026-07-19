@@ -7,7 +7,7 @@ pub mod config;
 pub mod engine;
 pub mod metrics;
 
-pub use config::LsmConfig;
+pub use config::{LsmConfig, SstableReadMode};
 pub use engine::LsmTreeEngine;
 pub use metrics::{
     LevelMetrics, OptimizationPriority, OptimizationRecommendation, PerformanceMetrics,

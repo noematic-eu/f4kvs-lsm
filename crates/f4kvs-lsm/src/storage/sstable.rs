@@ -2,6 +2,7 @@
 
 use crate::core::config::SstableConfig;
 use crate::error::{LsmError, Result};
+use crate::storage::file_reader::SstableFileReader;
 use crate::storage::SharedBlockCache;
 use crate::utils;
 use crc32fast::Hasher as Crc32Hasher;
@@ -9,8 +10,8 @@ use f4kvs_value::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::time::{sleep, Duration};
 use tracing::{error, warn};
 
@@ -397,9 +398,8 @@ pub struct SSTable {
     /// Bloom filter for fast key existence checks
     bloom_filter: Option<BloomFilter>,
 
-    /// File handle protected by RwLock to prevent concurrent access races
-    /// Each read operation needs exclusive access to the file handle due to seek position
-    file: tokio::sync::RwLock<Option<File>>,
+    /// Random-access file reader (seek or positioned reads, depending on config).
+    reader: SstableFileReader,
 
     /// Last access time for LRU eviction (nanoseconds since epoch)
     last_access: std::sync::atomic::AtomicU64,
@@ -433,13 +433,19 @@ impl SSTable {
             bloom_filter_hash_count: 7, // Default hash count
         };
 
+        let reader = SstableFileReader::new(
+            path.clone(),
+            config.read_mode,
+            config.mincore_cache_ttl_secs,
+        );
+
         Ok(Self {
             path,
             config,
             metadata,
             index: BTreeMap::new(),
             bloom_filter: None,
-            file: tokio::sync::RwLock::new(None),
+            reader,
             last_access: std::sync::atomic::AtomicU64::new(0),
             reader_count: std::sync::atomic::AtomicUsize::new(0),
             marked_for_deletion: std::sync::atomic::AtomicBool::new(false),
@@ -627,24 +633,11 @@ impl SSTable {
         // Update last access time
         self.update_last_access();
 
-        // If already open, just update access time
-        {
-            let file_guard = self.file.read().await;
-            if file_guard.is_some() {
-                return Ok(());
-            }
+        if self.reader.is_open() {
+            return Ok(());
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .open(&self.path)
-            .await
-            .map_err(LsmError::Io)?;
-
-        {
-            let mut file_guard = self.file.write().await;
-            *file_guard = Some(file);
-        }
+        self.reader.ensure_open(true).await?;
 
         // Read metadata and index
         self.read_metadata_and_index().await?;
@@ -674,23 +667,10 @@ impl SSTable {
 
     /// Ensure file is open, re-opening if necessary
     pub async fn ensure_file_open(&self) -> Result<()> {
-        let needs_open = {
-            let file_guard = self.file.read().await;
-            file_guard.is_none()
-        };
-
-        if needs_open {
+        if !self.reader.is_open() {
             if self.config.enable_resilient_handling {
                 warn!("Re-opening closed SSTable file: {:?}", self.path);
-                let file = OpenOptions::new()
-                    .read(true)
-                    .open(&self.path)
-                    .await
-                    .map_err(LsmError::Io)?;
-                {
-                    let mut file_guard = self.file.write().await;
-                    *file_guard = Some(file);
-                }
+                self.reader.ensure_open(true).await?;
                 self.update_last_access();
             } else {
                 return Err(LsmError::Internal(
@@ -698,7 +678,6 @@ impl SSTable {
                 ));
             }
         } else {
-            // Update access time even if already open
             self.update_last_access();
         }
         Ok(())
@@ -738,38 +717,23 @@ impl SSTable {
     async fn try_read_metadata_and_index(&mut self) -> Result<()> {
         self.ensure_file_open().await?;
 
-        let mut file_guard = self.file.write().await;
-        let file = file_guard
-            .as_mut()
-            .ok_or_else(|| LsmError::Internal("File not open".to_string()))?;
-
-        // Seek to end to read metadata
-        let file_size = file.metadata().await.map_err(LsmError::Io)?.len();
+        let file_size = self.reader.file_size().await?;
 
         // Read metadata from end of file (metadata is at the end, followed by its checksum)
-        // We need to read enough to get metadata + checksum (4 bytes)
-        let mut buffer = vec![0u8; 2048]; // Increased buffer size for metadata + checksum
+        let mut buffer = vec![0u8; 2048];
         let mut metadata_size = 0usize;
         let mut metadata_offset = 0u64;
 
-        // Read backwards to find metadata
-        // Metadata is at the end, followed by 4-byte checksum
         let mut pos = file_size;
         while pos > 0 && metadata_size == 0 {
             let read_size = std::cmp::min(pos, buffer.len() as u64) as usize;
             pos -= read_size as u64;
 
-            file.seek(tokio::io::SeekFrom::Start(pos))
-                .await
-                .map_err(LsmError::Io)?;
+            let bytes_read = self
+                .reader
+                .read_at(pos, &mut buffer[..read_size])
+                .await?;
 
-            let bytes_read = file
-                .read(&mut buffer[..read_size])
-                .await
-                .map_err(LsmError::Io)?;
-
-            // Try to deserialize metadata from this chunk
-            // Metadata is followed by 4-byte checksum, so we need at least metadata size + 4 bytes
             for i in (0..bytes_read.saturating_sub(4)).rev() {
                 if let Ok(metadata) =
                     bincode::deserialize::<SSTableMetadata>(&buffer[i..bytes_read - 4])
@@ -786,24 +750,17 @@ impl SSTable {
             return Err(LsmError::Corruption("Failed to read metadata".to_string()));
         }
 
-        // Read and validate metadata checksum
         let metadata_checksum_offset = metadata_offset + metadata_size as u64;
-        file.seek(tokio::io::SeekFrom::Start(metadata_checksum_offset))
-            .await
-            .map_err(LsmError::Io)?;
+        let stored_metadata_checksum = self
+            .reader
+            .read_u32_le_at(metadata_checksum_offset)
+            .await?;
 
-        let stored_metadata_checksum = file.read_u32_le().await.map_err(LsmError::Io)?;
-
-        // Read the metadata bytes to validate checksum
-        file.seek(tokio::io::SeekFrom::Start(metadata_offset))
-            .await
-            .map_err(LsmError::Io)?;
         let mut metadata_buffer = vec![0u8; metadata_size];
-        file.read_exact(&mut metadata_buffer)
-            .await
-            .map_err(LsmError::Io)?;
+        self.reader
+            .read_exact_at(metadata_offset, &mut metadata_buffer)
+            .await?;
 
-        // Validate metadata checksum
         let mut metadata_hasher = Crc32Hasher::new();
         metadata_hasher.update(&metadata_buffer);
         let computed_metadata_checksum = metadata_hasher.finalize();
@@ -816,23 +773,19 @@ impl SSTable {
             )));
         }
 
-        // Read index with checksum validation
         let index_start = self.metadata.index_offset;
         let index_size = self.metadata.index_size;
 
-        file.seek(tokio::io::SeekFrom::Start(index_start))
-            .await
-            .map_err(LsmError::Io)?;
-
         let mut index_buffer = vec![0u8; index_size as usize];
-        file.read_exact(&mut index_buffer)
-            .await
-            .map_err(LsmError::Io)?;
+        self.reader
+            .read_exact_at(index_start, &mut index_buffer)
+            .await?;
 
-        // Read index checksum
-        let stored_index_checksum = file.read_u32_le().await.map_err(LsmError::Io)?;
+        let stored_index_checksum = self
+            .reader
+            .read_u32_le_at(index_start + index_size)
+            .await?;
 
-        // Validate index checksum
         let mut index_hasher = Crc32Hasher::new();
         index_hasher.update(&index_buffer);
         let computed_index_checksum = index_hasher.finalize();
@@ -848,23 +801,19 @@ impl SSTable {
         self.index = bincode::deserialize(&index_buffer)
             .map_err(|e| LsmError::Serialization(format!("Failed to deserialize index: {}", e)))?;
 
-        // Read bloom filter with checksum validation
         let bloom_filter_start = self.metadata.bloom_filter_offset;
         let bloom_filter_size = self.metadata.bloom_filter_size;
 
         if bloom_filter_size > 0 {
-            // Read bloom filter data
-            file.seek(tokio::io::SeekFrom::Start(bloom_filter_start))
-                .await
-                .map_err(LsmError::Io)?;
-
             let mut bloom_filter_buffer = vec![0u8; bloom_filter_size as usize];
-            file.read_exact(&mut bloom_filter_buffer)
-                .await
-                .map_err(LsmError::Io)?;
+            self.reader
+                .read_exact_at(bloom_filter_start, &mut bloom_filter_buffer)
+                .await?;
 
-            // Read bloom filter checksum
-            let stored_bloom_checksum = file.read_u32_le().await.map_err(LsmError::Io)?;
+            let stored_bloom_checksum = self
+                .reader
+                .read_u32_le_at(bloom_filter_start + bloom_filter_size)
+                .await?;
 
             // Validate bloom filter checksum
             let mut bloom_hasher = Crc32Hasher::new();
@@ -941,6 +890,32 @@ impl SSTable {
         key: &str,
         block_cache: Option<&SharedBlockCache>,
     ) -> Result<Option<Value>> {
+        self.reader_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut guard = ReaderGuard::new(&self.reader_count, false);
+        self.get_with_reader_guard(key, block_cache, &mut guard)
+            .await
+    }
+
+    /// Get value when the caller already pinned this SSTable via `reader_count`.
+    ///
+    /// Used by the engine to hold a read pin across LRU file-handle eviction.
+    pub(crate) async fn get_pinned(
+        &self,
+        key: &str,
+        block_cache: Option<&SharedBlockCache>,
+    ) -> Result<Option<Value>> {
+        let mut guard = ReaderGuard::new(&self.reader_count, true);
+        self.get_with_reader_guard(key, block_cache, &mut guard)
+            .await
+    }
+
+    async fn get_with_reader_guard(
+        &self,
+        key: &str,
+        block_cache: Option<&SharedBlockCache>,
+        guard: &mut ReaderGuard<'_>,
+    ) -> Result<Option<Value>> {
         // CRITICAL: Check if SSTable is ready before allowing reads
         // This prevents reads from happening before metadata/index are fully loaded
         if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
@@ -955,12 +930,6 @@ impl SSTable {
             return Ok(None);
         }
 
-        // Increment reader count FIRST before any checks
-        // This ensures we're counted as a reader even if deletion happens during the read
-        // Use a guard pattern to ensure reader count is always decremented on error paths
-        self.reader_count
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-
         // Check if marked for deletion AFTER incrementing reader count
         // This ensures we're counted as a reader before checking deletion status
         // If marked for deletion, we still allow the read to proceed to prevent data loss
@@ -973,41 +942,6 @@ impl SSTable {
                 self.reader_count()
             );
         }
-
-        // Guard to ensure reader count is decremented on error return paths
-        // On success, we manually decrement before returning
-        struct ReaderGuard<'a> {
-            reader_count: &'a std::sync::atomic::AtomicUsize,
-            decremented: bool,
-        }
-
-        impl<'a> ReaderGuard<'a> {
-            fn new(reader_count: &'a std::sync::atomic::AtomicUsize) -> Self {
-                Self {
-                    reader_count,
-                    decremented: false,
-                }
-            }
-
-            fn decrement(&mut self) {
-                if !self.decremented {
-                    self.reader_count
-                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    self.decremented = true;
-                }
-            }
-        }
-
-        impl<'a> Drop for ReaderGuard<'a> {
-            fn drop(&mut self) {
-                if !self.decremented {
-                    self.reader_count
-                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                }
-            }
-        }
-
-        let mut guard = ReaderGuard::new(&self.reader_count);
 
         // Update last access time for LRU tracking
         self.update_last_access();
@@ -1159,12 +1093,15 @@ impl SSTable {
                         return Err(e);
                     }
 
-                    // Check if this is a transient error (EOF, incomplete file)
+                    // Check if this is a transient error (EOF, incomplete file, LRU close)
                     let is_transient = match &e {
                         LsmError::Io(io_err) => {
                             io_err.kind() == std::io::ErrorKind::UnexpectedEof
                                 || io_err.to_string().contains("EOF")
                                 || io_err.to_string().contains("incomplete")
+                        }
+                        LsmError::Internal(msg) => {
+                            msg.contains("File not open") || msg.contains("not ready during read")
                         }
                         _ => false,
                     };
@@ -1216,14 +1153,10 @@ impl SSTable {
             )));
         }
 
-        // Acquire write lock to get exclusive access to file handle during read
-        // This prevents concurrent reads from interfering with each other's seek positions
-        let mut file_guard = self.file.write().await;
-        let file = file_guard
-            .as_mut()
-            .ok_or_else(|| LsmError::Internal("File not open".to_string()))?;
+        // Re-open if LRU eviction closed the handle between ensure_sstable_open and this read
+        self.ensure_file_open().await?;
 
-        // Double-check that SSTable is still ready after getting file handle
+        // Double-check that SSTable is still ready after opening the reader
         // This prevents race conditions where the SSTable becomes not ready between check and file access
         if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LsmError::Internal(format!(
@@ -1241,8 +1174,7 @@ impl SSTable {
             )));
         }
 
-        // Validate file size before reading
-        let file_size = file.metadata().await.map_err(LsmError::Io)?.len();
+        let file_size = self.reader.file_size().await?;
 
         // Validate file size matches expected metadata (with tolerance for metadata/index/bloom)
         // The file should be at least as large as the metadata indicates
@@ -1287,15 +1219,9 @@ impl SSTable {
             )));
         }
 
-        file.seek(tokio::io::SeekFrom::Start(offset))
-            .await
-            .map_err(LsmError::Io)?;
-
-        // Read entry size
-        let entry_size = match file.read_u32_le().await {
+        let entry_size = match self.reader.read_u32_le_at(offset).await {
             Ok(size) => size,
-            Err(e) => {
-                // Check if this is an EOF error
+            Err(LsmError::Io(e)) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     return Err(LsmError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -1307,6 +1233,7 @@ impl SSTable {
                 }
                 return Err(LsmError::Io(e));
             }
+            Err(e) => return Err(e),
         };
 
         // Validate entry size is reasonable (not too large)
@@ -1346,11 +1273,14 @@ impl SSTable {
             )));
         }
 
-        // Read entry data
         let mut entry_buffer = vec![0u8; entry_size as usize];
-        match file.read_exact(&mut entry_buffer).await {
-            Ok(_) => {}
-            Err(e) => {
+        match self
+            .reader
+            .read_exact_at(offset + 4, &mut entry_buffer)
+            .await
+        {
+            Ok(()) => {}
+            Err(LsmError::Io(e)) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     return Err(LsmError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -1362,12 +1292,16 @@ impl SSTable {
                 }
                 return Err(LsmError::Io(e));
             }
+            Err(e) => return Err(e),
         }
 
-        // Read stored checksum
-        let stored_checksum = match file.read_u32_le().await {
+        let stored_checksum = match self
+            .reader
+            .read_u32_le_at(offset + 4 + entry_size as u64)
+            .await
+        {
             Ok(checksum) => checksum,
-            Err(e) => {
+            Err(LsmError::Io(e)) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     return Err(LsmError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -1379,6 +1313,7 @@ impl SSTable {
                 }
                 return Err(LsmError::Io(e));
             }
+            Err(e) => return Err(e),
         };
 
         // Compute checksum of read data
@@ -1397,7 +1332,7 @@ impl SSTable {
 
             // Check if this might be a race condition (file being written)
             // If the file size changed between metadata check and read, it might be a race
-            let current_file_size = file.metadata().await.map_err(LsmError::Io)?.len();
+            let current_file_size = self.reader.file_size().await?;
             if current_file_size != file_size {
                 // File size changed - this is a race condition, treat as transient
                 return Err(LsmError::Io(std::io::Error::new(
@@ -1445,6 +1380,18 @@ impl SSTable {
     /// Get current reader count
     pub fn reader_count(&self) -> usize {
         self.reader_count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Increment reader count before opening a file handle for LRU-protected reads.
+    pub(crate) fn pin_reader(&self) {
+        self.reader_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Decrement reader count after a pinned read completes.
+    pub(crate) fn unpin_reader(&self) {
+        self.reader_count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Check if safe to delete (no active readers)
@@ -1645,11 +1592,7 @@ impl SSTable {
 
     /// Check if SSTable is open
     pub fn is_open(&self) -> bool {
-        // Use try_read to avoid blocking - if we can't get the lock, assume it's open
-        match self.file.try_read() {
-            Ok(guard) => guard.is_some(),
-            Err(_) => true, // Lock held means file is being accessed, so it's open
-        }
+        self.reader.is_open()
     }
 
     /// Check if SSTable is ready for reads
@@ -1666,8 +1609,7 @@ impl SSTable {
 
     /// Close SSTable file handle
     pub async fn close(&mut self) -> Result<()> {
-        let mut file_guard = self.file.write().await;
-        *file_guard = None;
+        self.reader.close().await;
         Ok(())
     }
 
@@ -1691,7 +1633,11 @@ impl SSTable {
             metadata: self.metadata.clone(),
             index: self.index.clone(),
             bloom_filter: self.bloom_filter.clone(),
-            file: tokio::sync::RwLock::new(None), // Don't clone file handle
+            reader: SstableFileReader::new(
+                self.path.clone(),
+                self.config.read_mode,
+                self.config.mincore_cache_ttl_secs,
+            ),
             last_access: std::sync::atomic::AtomicU64::new(
                 self.last_access.load(std::sync::atomic::Ordering::Relaxed),
             ),
@@ -1707,5 +1653,38 @@ impl SSTable {
 impl Clone for SSTable {
     fn clone(&self) -> Self {
         self.clone_for_testing()
+    }
+}
+
+/// Guard to ensure reader count is decremented on error return paths.
+struct ReaderGuard<'a> {
+    reader_count: &'a std::sync::atomic::AtomicUsize,
+    decremented: bool,
+    /// When true, the caller already incremented `reader_count` (engine read pin).
+    external: bool,
+}
+
+impl<'a> ReaderGuard<'a> {
+    fn new(reader_count: &'a std::sync::atomic::AtomicUsize, external: bool) -> Self {
+        Self {
+            reader_count,
+            decremented: false,
+            external,
+        }
+    }
+
+    fn decrement(&mut self) {
+        if self.external || self.decremented {
+            return;
+        }
+        self.reader_count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.decremented = true;
+    }
+}
+
+impl<'a> Drop for ReaderGuard<'a> {
+    fn drop(&mut self) {
+        self.decrement();
     }
 }

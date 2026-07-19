@@ -4,6 +4,8 @@
 //! SSTables, write-ahead logging, and block cache.
 
 pub mod block_cache;
+pub mod file_reader;
+pub mod mmap_reader;
 pub mod memtable;
 pub mod sstable;
 pub mod wal;
@@ -15,6 +17,7 @@ pub mod wal_indexed;
 pub mod wal_sync;
 
 pub use block_cache::{BlockCache, BlockCacheMetrics, CacheStats, SharedBlockCache};
+pub use file_reader::SstableFileReader;
 pub use memtable::{Memtable, MemtableLookupResult, PutEffect};
 pub use sstable::SSTable;
 pub use wal::{WALEntry, WALManager};

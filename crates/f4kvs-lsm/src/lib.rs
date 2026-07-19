@@ -61,7 +61,7 @@ pub mod storage;
 pub mod utils;
 
 // Re-export main types for convenience
-pub use core::{LsmConfig, LsmStorage, LsmTreeEngine};
+pub use core::{LsmConfig, LsmStorage, LsmTreeEngine, SstableReadMode};
 pub use error::{LsmError, Result as LsmResult};
 
 /// Create an LSM storage engine from a storage configuration
