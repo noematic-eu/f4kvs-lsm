@@ -19,6 +19,6 @@ pub mod wal_sync;
 pub use block_cache::{BlockCache, BlockCacheMetrics, CacheStats, SharedBlockCache};
 pub use file_reader::SstableFileReader;
 pub use memtable::{Memtable, MemtableLookupResult, PutEffect};
-pub use sstable::SSTable;
+pub use sstable::{SSTable, SstableLookupResult};
 pub use wal::{WALEntry, WALManager};
 pub use wal_handle::WalHandle;

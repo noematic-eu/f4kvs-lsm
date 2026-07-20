@@ -1084,13 +1084,15 @@ impl LsmTreeEngine {
         // This ensures SSTable entries are already sorted, improving read performance
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Generate unique SSTable filename
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| LsmError::Internal(format!("Failed to get timestamp: {}", e)))?
-            .as_millis();
+        // Generate unique SSTable filename. Millisecond timestamps collide under
+        // rapid flushes (force_durable puts + immediate delete flush), which
+        // overwrites the prior L0 file while the old SSTable handle still
+        // holds the previous index — resurrecting deleted keys on read.
+        let seq = self
+            .sequence_number
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sstable_path =
-            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", timestamp));
+            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", seq));
 
         // Create SSTable
         let mut sstable = SSTable::new(sstable_path, self.config.sstable.clone(), 0)?;
@@ -1101,13 +1103,13 @@ impl LsmTreeEngine {
         let sstable_entries: Vec<SSTableEntry> = entries
             .into_iter()
             .map(|(key, value, deleted)| {
-                let seq = self
+                let entry_seq = self
                     .sequence_number
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 SSTableEntry {
                     key,
                     value,
-                    timestamp: seq,
+                    timestamp: entry_seq,
                     deleted,
                 }
             })
@@ -1192,13 +1194,12 @@ impl LsmTreeEngine {
     /// Note: Reserved for future use in background compaction/flush operations
     #[allow(dead_code)]
     async fn flush_memtable_to_sstable(&self, memtable: Memtable) -> Result<()> {
-        // Generate unique SSTable filename
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| LsmError::Internal(format!("Failed to get timestamp: {}", e)))?
-            .as_millis();
+        // Unique filename via sequence (ms timestamps collide under rapid flushes).
+        let seq = self
+            .sequence_number
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sstable_path =
-            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", timestamp));
+            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", seq));
 
         // Create SSTable
         let mut sstable = SSTable::new(sstable_path, self.config.sstable.clone(), 0)?;
@@ -1421,8 +1422,14 @@ impl LsmTreeEngine {
         Ok(merged.into_iter().collect())
     }
 
-    /// Get value from SSTables (slow path)
+    /// Get value from SSTables (slow path).
+    ///
+    /// L0 files may overlap; they are probed newest-first. A tombstone in a
+    /// newer file must stop the search — collapsing it to "miss" and reading
+    /// an older live value resurrects deleted keys after memtable flush.
     async fn get_from_sstables(&self, key: &str) -> Result<Option<Value>> {
+        use crate::storage::sstable::SstableLookupResult;
+
         for level in 0..self.config.levels.count {
             let candidate_indices: Vec<usize> = {
                 let sstables = self.sstables.read().await;
@@ -1457,9 +1464,10 @@ impl LsmTreeEngine {
                 let sstable = &*sstable;
                 #[cfg(feature = "metrics")]
                 record_sstable_read(&self.metrics);
-                match sstable.get_pinned(key, Some(&self.block_cache)).await {
-                    Ok(Some(value)) => return Ok(Some(value)),
-                    Ok(None) => {}
+                match sstable.lookup_pinned(key, Some(&self.block_cache)).await {
+                    Ok(SstableLookupResult::Found(value)) => return Ok(Some(value)),
+                    Ok(SstableLookupResult::Tombstone) => return Ok(None),
+                    Ok(SstableLookupResult::Missing) => {}
                     Err(e) => debug!("Error reading from SSTable L{level}[{idx}]: {e}"),
                 }
             }
@@ -1756,17 +1764,26 @@ impl StorageEngine for LsmTreeEngine {
             }
         }
 
-        // Check memtables first
-        if self
+        // Check memtables first (including tombstones — a delete must not
+        // fall through to an older SSTable live value).
+        match self
             .get_from_memtables(key)
             .await
             .map_err(Self::convert_error)?
-            .is_some()
         {
-            return Ok(true);
+            Some(_) => return Ok(true),
+            None => {
+                if self
+                    .has_tombstone_in_memtables(key)
+                    .await
+                    .map_err(Self::convert_error)?
+                {
+                    return Ok(false);
+                }
+            }
         }
 
-        // Check SSTables
+        // Check SSTables (get_from_sstables already honours L0 tombstones)
         if self
             .get_from_sstables(key)
             .await

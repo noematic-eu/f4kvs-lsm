@@ -343,6 +343,22 @@ pub struct SSTableEntry {
     pub deleted: bool,
 }
 
+/// Result of a key lookup in a single SSTable.
+///
+/// Distinguishes a tombstone (key was deleted in this file) from a pure miss
+/// (key never written in this file). Callers that merge multiple L0 files must
+/// stop on [`SstableLookupResult::Tombstone`] — treating a tombstone as
+/// `None` and continuing to older files resurrects deleted keys.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SstableLookupResult {
+    /// Live value found
+    Found(Value),
+    /// Deletion tombstone — newer than any older SSTable value for this key
+    Tombstone,
+    /// Key not present in this SSTable
+    Missing,
+}
+
 /// SSTable metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SSTableMetadata {
@@ -554,12 +570,12 @@ impl SSTable {
         // Update offset for bloom filter
         offset += index_data.len() as u64 + 4; // index + checksum
 
-        // Create and write bloom filter
+        // Create and write bloom filter. Include tombstones: if a deleted key
+        // is omitted, key_may_exist/lookup bloom-rejects the newer L0 file and
+        // the merge falls through to an older live value (resurrects deletes).
         let mut bloom_filter = BloomFilter::with_optimal_params(entries.len());
         for entry in &entries {
-            if !entry.deleted {
-                bloom_filter.add(&entry.key);
-            }
+            bloom_filter.add(&entry.key);
         }
 
         let bloom_filter_data = bloom_filter.to_bytes();
@@ -900,13 +916,28 @@ impl SSTable {
     /// Get value when the caller already pinned this SSTable via `reader_count`.
     ///
     /// Used by the engine to hold a read pin across LRU file-handle eviction.
+    /// Tombstones are returned as `None` (same as missing) — prefer
+    /// [`Self::lookup_pinned`] when merging overlapping L0 files.
+    #[allow(dead_code)] // retained for callers that only need Option semantics
     pub(crate) async fn get_pinned(
         &self,
         key: &str,
         block_cache: Option<&SharedBlockCache>,
     ) -> Result<Option<Value>> {
+        match self.lookup_pinned(key, block_cache).await? {
+            SstableLookupResult::Found(v) => Ok(Some(v)),
+            SstableLookupResult::Tombstone | SstableLookupResult::Missing => Ok(None),
+        }
+    }
+
+    /// Lookup that distinguishes tombstones from misses (needed for L0 merge).
+    pub(crate) async fn lookup_pinned(
+        &self,
+        key: &str,
+        block_cache: Option<&SharedBlockCache>,
+    ) -> Result<SstableLookupResult> {
         let mut guard = ReaderGuard::new(&self.reader_count, true);
-        self.get_with_reader_guard(key, block_cache, &mut guard)
+        self.lookup_with_reader_guard(key, block_cache, &mut guard)
             .await
     }
 
@@ -916,6 +947,21 @@ impl SSTable {
         block_cache: Option<&SharedBlockCache>,
         guard: &mut ReaderGuard<'_>,
     ) -> Result<Option<Value>> {
+        match self
+            .lookup_with_reader_guard(key, block_cache, guard)
+            .await?
+        {
+            SstableLookupResult::Found(v) => Ok(Some(v)),
+            SstableLookupResult::Tombstone | SstableLookupResult::Missing => Ok(None),
+        }
+    }
+
+    async fn lookup_with_reader_guard(
+        &self,
+        key: &str,
+        block_cache: Option<&SharedBlockCache>,
+        guard: &mut ReaderGuard<'_>,
+    ) -> Result<SstableLookupResult> {
         // CRITICAL: Check if SSTable is ready before allowing reads
         // This prevents reads from happening before metadata/index are fully loaded
         if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
@@ -927,7 +973,7 @@ impl SSTable {
         }
 
         if !self.key_may_exist(key) {
-            return Ok(None);
+            return Ok(SstableLookupResult::Missing);
         }
 
         // Check if marked for deletion AFTER incrementing reader count
@@ -959,14 +1005,14 @@ impl SSTable {
         // Check if key is in range
         if key < self.metadata.smallest_key.as_str() || key > self.metadata.largest_key.as_str() {
             log::trace!("Key '{}' is out of range", key);
-            return Ok(None);
+            return Ok(SstableLookupResult::Missing);
         }
 
         // Use bloom filter for fast key existence check
         if let Some(ref bloom_filter) = self.bloom_filter {
             if !bloom_filter.might_contain(key) {
                 log::trace!("Bloom filter says key '{}' is not present", key);
-                return Ok(None); // Key definitely not present
+                return Ok(SstableLookupResult::Missing); // Key definitely not present
             }
             log::trace!("Bloom filter says key '{}' might be present", key);
         }
@@ -1027,7 +1073,7 @@ impl SSTable {
                 );
                 // Decrement reader count before returning
                 guard.decrement();
-                return Ok(None);
+                return Ok(SstableLookupResult::Missing);
             }
         };
 
@@ -1071,9 +1117,11 @@ impl SSTable {
                     // Manually decrement reader count before returning on success
                     guard.decrement();
                     if entry.deleted {
-                        return Ok(None);
+                        // Tombstone must not be collapsed to Missing: L0 merge
+                        // would otherwise fall through to an older live value.
+                        return Ok(SstableLookupResult::Tombstone);
                     } else {
-                        return Ok(Some(entry.value));
+                        return Ok(SstableLookupResult::Found(entry.value));
                     }
                 }
                 Err(e) => {
