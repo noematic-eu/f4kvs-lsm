@@ -35,10 +35,14 @@ metrics = []
 # Stub for optional TTL integration (wired by f4kvs-v2 when needed).
 ttl = []
 
+[[bench]]
+name = "sstable_read_mode"
+harness = false
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile.workspace = true
-criterion = { workspace = true, features = ["html_reports"] }
+criterion = { workspace = true, features = ["html_reports", "async_tokio"] }
 rand = { workspace = true }
 serde_json.workspace = true
 proptest = { workspace = true }

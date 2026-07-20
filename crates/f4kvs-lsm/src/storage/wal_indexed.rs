@@ -155,16 +155,33 @@ impl IndexedWalSegment {
         Ok(ids)
     }
 
+    /// Frames still available for new commits (`staging_frame` is the next frame id).
+    fn frames_remaining(&self) -> u32 {
+        if self.staging_frame == 0 || self.staging_frame > self.data_frame_count {
+            0
+        } else {
+            self.data_frame_count - self.staging_frame + 1
+        }
+    }
+
+    fn has_frame_capacity(&self) -> bool {
+        self.frames_remaining() > 0
+    }
+
+    /// Flush staged bytes into the next frame.
+    ///
+    /// Returns `Ok(false)` when the segment has no free frames left (caller must rotate).
+    /// Staging is left intact when returning `Ok(false)`.
     async fn flush_staging(
         &mut self,
         index: &mut WalIndexFile,
         index_state: &mut WalIndexHeader,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.staging.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
-        if self.staging_frame > self.data_frame_count {
-            return Err(LsmError::Internal("indexed wal segment full".into()));
+        if !self.has_frame_capacity() {
+            return Ok(false);
         }
 
         let frame_id = self.staging_frame;
@@ -182,7 +199,7 @@ impl IndexedWalSegment {
         self.staging.clear();
         self.entries_in_staging = 0;
         self.staging_frame = self.staging_frame.saturating_add(1);
-        Ok(())
+        Ok(true)
     }
 
     async fn commit_frame(
@@ -202,29 +219,39 @@ impl IndexedWalSegment {
         Ok(())
     }
 
+    /// Append one entry. Returns `Ok(false)` if the segment is full (entry not written).
     pub async fn append_entry(
         &mut self,
         entry: &WALEntry,
         index: &mut WalIndexFile,
         index_state: &mut WalIndexHeader,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let encoded = Self::encode_entry(entry)?;
 
         if encoded.len() > self.frame_size {
             if !self.staging.is_empty() {
-                self.flush_staging(index, index_state).await?;
+                if !self.flush_staging(index, index_state).await? {
+                    return Ok(false);
+                }
+            }
+            if !self.has_frame_capacity() {
+                return Ok(false);
             }
             let frame_id = self.staging_frame;
-            if frame_id > self.data_frame_count {
-                return Err(LsmError::Internal("indexed wal segment full".into()));
-            }
             self.commit_frame(frame_id, &encoded, 1, index, index_state)
                 .await?;
-            return Ok(());
+            return Ok(true);
         }
 
         if !self.staging.is_empty() && self.staging.len() + encoded.len() > self.frame_size {
-            self.flush_staging(index, index_state).await?;
+            if !self.flush_staging(index, index_state).await? {
+                return Ok(false);
+            }
+        }
+
+        // Starting a new frame requires free capacity.
+        if self.staging.is_empty() && !self.has_frame_capacity() {
+            return Ok(false);
         }
 
         if self.staging.is_empty() && encoded.len() == self.frame_size {
@@ -237,41 +264,71 @@ impl IndexedWalSegment {
         self.entries_in_staging += 1;
 
         if self.sync_mode == WalSyncMode::Fsync || self.sync_mode == WalSyncMode::FsyncAsync {
-            self.flush_staging(index, index_state).await?;
+            // Per-commit durability: one frame per entry. Capacity was checked above.
+            if !self.flush_staging(index, index_state).await? {
+                // Staging holds this entry but no frame left — should not happen after the
+                // empty-staging capacity check; treat as need-rotate and keep staging so the
+                // manager can only rotate after a successful flush path.
+                return Ok(false);
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
+    /// Append as many entries as fit. Returns how many were fully committed to frames.
+    ///
+    /// When the return value is less than `entries.len()`, the segment is full and the
+    /// caller should rotate then continue with the remainder. Unflushed staging only
+    /// contains entries already counted in the return value when packing without
+    /// per-entry fsync — the manager must flush or rotate after.
     pub async fn append_entries_batch(
         &mut self,
         entries: &[WALEntry],
         index: &mut WalIndexFile,
         index_state: &mut WalIndexHeader,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        let mut written = 0usize;
         for entry in entries {
             let encoded = Self::encode_entry(entry)?;
             if encoded.len() > self.frame_size {
                 if !self.staging.is_empty() {
-                    self.flush_staging(index, index_state).await?;
+                    if !self.flush_staging(index, index_state).await? {
+                        return Ok(written);
+                    }
+                }
+                if !self.has_frame_capacity() {
+                    return Ok(written);
                 }
                 let frame_id = self.staging_frame;
-                if frame_id > self.data_frame_count {
-                    return Err(LsmError::Internal("indexed wal segment full".into()));
-                }
                 self.commit_frame(frame_id, &encoded, 1, index, index_state)
                     .await?;
+                written += 1;
                 continue;
             }
             if !self.staging.is_empty() && self.staging.len() + encoded.len() > self.frame_size {
-                self.flush_staging(index, index_state).await?;
+                if !self.flush_staging(index, index_state).await? {
+                    return Ok(written);
+                }
+            }
+            if self.staging.is_empty() && !self.has_frame_capacity() {
+                return Ok(written);
             }
             self.staging.extend_from_slice(&encoded);
             self.entries_in_staging += 1;
+            written += 1;
         }
         if !self.staging.is_empty() {
-            self.flush_staging(index, index_state).await?;
+            if !self.flush_staging(index, index_state).await? {
+                // Entries sit in staging without a free frame. Roll back the count for
+                // unflushed staging so the caller re-writes them after rotation.
+                let uncommitted = self.entries_in_staging as usize;
+                written = written.saturating_sub(uncommitted);
+                self.staging.clear();
+                self.entries_in_staging = 0;
+                return Ok(written);
+            }
         }
-        Ok(())
+        Ok(written)
     }
 
     pub async fn read_committed_entries(
@@ -440,6 +497,23 @@ impl IndexedWalManager {
     }
 
     async fn rotate_segment(&self) -> Result<()> {
+        // Flush any staged bytes on the current segment before sealing it.
+        {
+            let mut current = self.current_segment.write().await;
+            if let Some(segment) = current.as_mut() {
+                let mut index_guard = self.index.write().await;
+                if let Some(index) = index_guard.as_mut() {
+                    let mut state = index.latest();
+                    if !segment.flush_staging(index, &mut state).await? {
+                        return Err(LsmError::Internal(
+                            "indexed wal segment full with unflushed staging; cannot rotate"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+
         let mut current = self.current_segment.write().await;
         if let Some(segment) = current.take() {
             let id = segment.segment_id() as u64;
@@ -472,6 +546,8 @@ impl IndexedWalManager {
         let mut header = index.latest();
         header.segment_id = segment_id;
         header.frame_size = self.frame_size as u32;
+        // New segment starts empty; keep a durable watermark pointing at it so recovery
+        // knows which segment is active. Prior sealed segments remain on disk under frames/.
         index.commit(header).await?;
 
         *self.index.write().await = Some(index);
@@ -497,16 +573,30 @@ impl IndexedWalManager {
     }
 
     pub async fn write_entry(&self, entry: &WALEntry) -> Result<()> {
-        let mut segment_guard = self.current_segment.write().await;
-        let segment = segment_guard.as_mut().ok_or_else(|| {
-            LsmError::Internal("indexed wal segment not initialized".into())
-        })?;
-        let mut index_guard = self.index.write().await;
-        let index = index_guard.as_mut().ok_or_else(|| {
-            LsmError::Internal("wal.idx not initialized".into())
-        })?;
-        let mut state = index.latest();
-        segment.append_entry(entry, index, &mut state).await
+        // Match segment/frame WAL: if the active segment is full, rotate and retry.
+        for attempt in 0..2 {
+            let accepted = {
+                let mut segment_guard = self.current_segment.write().await;
+                let segment = segment_guard.as_mut().ok_or_else(|| {
+                    LsmError::Internal("indexed wal segment not initialized".into())
+                })?;
+                let mut index_guard = self.index.write().await;
+                let index = index_guard.as_mut().ok_or_else(|| {
+                    LsmError::Internal("wal.idx not initialized".into())
+                })?;
+                let mut state = index.latest();
+                segment.append_entry(entry, index, &mut state).await?
+            };
+            if accepted {
+                return Ok(());
+            }
+            if attempt == 0 {
+                self.rotate_segment().await?;
+            }
+        }
+        Err(LsmError::Internal(
+            "indexed wal write failed after segment rotation".into(),
+        ))
     }
 
     pub async fn batch_write_operations(
@@ -526,18 +616,40 @@ impl IndexedWalManager {
             })
             .collect();
 
-        let mut segment_guard = self.current_segment.write().await;
-        let segment = segment_guard.as_mut().ok_or_else(|| {
-            LsmError::Internal("indexed wal segment not initialized".into())
-        })?;
-        let mut index_guard = self.index.write().await;
-        let index = index_guard.as_mut().ok_or_else(|| {
-            LsmError::Internal("wal.idx not initialized".into())
-        })?;
-        let mut state = index.latest();
-        segment
-            .append_entries_batch(&entries, index, &mut state)
-            .await
+        let mut offset = 0usize;
+        let mut empty_rotations = 0u8;
+        while offset < entries.len() {
+            let written = {
+                let mut segment_guard = self.current_segment.write().await;
+                let segment = segment_guard.as_mut().ok_or_else(|| {
+                    LsmError::Internal("indexed wal segment not initialized".into())
+                })?;
+                let mut index_guard = self.index.write().await;
+                let index = index_guard.as_mut().ok_or_else(|| {
+                    LsmError::Internal("wal.idx not initialized".into())
+                })?;
+                let mut state = index.latest();
+                segment
+                    .append_entries_batch(&entries[offset..], index, &mut state)
+                    .await?
+            };
+            if written == 0 {
+                empty_rotations += 1;
+                if empty_rotations > 2 {
+                    return Err(LsmError::Internal(
+                        "indexed wal batch made no progress after rotation".into(),
+                    ));
+                }
+                self.rotate_segment().await?;
+                continue;
+            }
+            empty_rotations = 0;
+            offset += written;
+            if offset < entries.len() {
+                self.rotate_segment().await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -546,7 +658,11 @@ impl IndexedWalManager {
             let mut index_guard = self.index.write().await;
             if let Some(index) = index_guard.as_mut() {
                 let mut state = index.latest();
-                segment.flush_staging(index, &mut state).await?;
+                if !segment.flush_staging(index, &mut state).await? {
+                    return Err(LsmError::Internal(
+                        "indexed wal flush failed: segment full with staged data".into(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -558,49 +674,62 @@ impl IndexedWalManager {
             return Ok(all);
         }
 
-        let index_path = self.index_path.clone();
-        if index_path.exists() {
+        // Recover every sealed/active frames directory. wal.idx only watermarks the
+        // *current* segment; prior rotated segments are fully durable on disk.
+        let mut active_segment_id: Option<u32> = None;
+        let mut active_state: Option<WalIndexHeader> = None;
+        if self.index_path.exists() {
             let mut index =
-                WalIndexFile::open(index_path, 0, self.frame_size as u32).await?;
+                WalIndexFile::open(self.index_path.clone(), 0, self.frame_size as u32).await?;
             if let Ok(state) = index.read_latest().await {
-                let frames_dir = segment_frames_dir(&self.wal_dir, state.segment_id);
-                if frames_dir.exists() {
-                    let segment = IndexedWalSegment::open_existing(
-                        frames_dir,
-                        state.segment_id,
-                        self.frame_size,
-                        self.data_frame_count,
-                        self.config.sync_mode,
-                        state.committed_frame.saturating_add(1),
-                    )
-                    .await?;
-                    all.extend(segment.read_committed_entries(state).await?);
-                }
+                active_segment_id = Some(state.segment_id);
+                active_state = Some(state);
             }
         }
 
-        let segments = self.segments.read().await;
-        for (_, frames_dir) in segments.iter() {
-            if !frames_dir.exists() {
-                continue;
+        let root = frames_root(&self.wal_dir);
+        if root.exists() {
+            let mut segment_dirs: Vec<(u32, PathBuf)> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if let Ok(id) = u32::from_str_radix(name, 16) {
+                        segment_dirs.push((id, path));
+                    }
+                }
             }
-            let segment_id = frames_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|s| u32::from_str_radix(s, 16).ok())
-                .unwrap_or(0);
-            let segment = IndexedWalSegment::open_existing(
-                frames_dir.clone(),
-                segment_id,
-                self.frame_size,
-                self.data_frame_count,
-                self.config.sync_mode,
-                1,
-            )
-            .await?;
-            let state = WalIndexHeader::new(segment_id, segment.frame_size as u32);
-            if let Ok(entries) = segment.read_committed_entries(state).await {
-                all.extend(entries);
+            segment_dirs.sort_by_key(|(id, _)| *id);
+
+            for (segment_id, frames_dir) in segment_dirs {
+                let segment = IndexedWalSegment::open_existing(
+                    frames_dir,
+                    segment_id,
+                    self.frame_size,
+                    self.data_frame_count,
+                    self.config.sync_mode,
+                    1,
+                )
+                .await?;
+                let state = if active_segment_id == Some(segment_id) {
+                    active_state.unwrap_or_else(|| {
+                        WalIndexHeader::new(segment_id, self.frame_size as u32)
+                    })
+                } else {
+                    // Sealed segment: read all frames present (watermark = max frame file).
+                    let mut sealed = WalIndexHeader::new(segment_id, self.frame_size as u32);
+                    if let Ok(ids) = segment.list_committed_frame_ids() {
+                        sealed.committed_frame = *ids.last().unwrap_or(&0);
+                        sealed.committed_offset = 0; // read full frames for sealed segments
+                    }
+                    sealed
+                };
+                all.extend(segment.read_committed_entries(state).await?);
             }
         }
 
@@ -788,5 +917,94 @@ mod tests {
 
         let entries = wal.read_entries_from_disk().await.unwrap();
         assert_eq!(entries.len(), 10);
+    }
+
+    /// Reproduces the bench failure: more per-commit puts than the segment frame budget
+    /// must rotate instead of returning "indexed wal segment full".
+    ///
+    /// Note: `IndexedWalManager` clamps `indexed_frame_count` to at least 64.
+    #[tokio::test]
+    async fn indexed_wal_rotates_when_segment_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = WalConfig::default();
+        cfg.dir = dir.path().join("wal");
+        cfg.sync_mode = WalSyncMode::Fsync;
+        cfg.engine = crate::core::config::WalEngine::Indexed;
+        // Minimum effective budget is 64 frames; Fsync => 1 frame per put.
+        cfg.indexed_frame_count = 64;
+
+        let wal = IndexedWalManager::new(&cfg).unwrap();
+        wal.initialize().await.unwrap();
+
+        let payload = Value::Bytes(vec![b'x'; 512]);
+        let n = 130; // > 2× frame budget
+        for i in 0..n {
+            wal.write_operation(&format!("chunk:{i:05}"), &payload)
+                .await
+                .unwrap_or_else(|e| panic!("put {i} failed: {e}"));
+        }
+
+        let entries = wal.read_entries_from_disk().await.unwrap();
+        assert_eq!(entries.len(), n);
+
+        // Multiple segment directories must exist after rotation.
+        let frames_root = cfg.dir.join("frames");
+        let seg_count = std::fs::read_dir(&frames_root)
+            .unwrap()
+            .filter(|e| e.as_ref().map(|e| e.path().is_dir()).unwrap_or(false))
+            .count();
+        assert!(
+            seg_count >= 2,
+            "expected multiple frame segments after rotation, got {seg_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_wal_batch_rotates_when_segment_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = WalConfig::default();
+        cfg.dir = dir.path().join("wal");
+        cfg.sync_mode = WalSyncMode::Fsync;
+        // Effective floor is 64 frames; use values that need their own frame.
+        cfg.indexed_frame_count = 64;
+
+        let wal = IndexedWalManager::new(&cfg).unwrap();
+        wal.initialize().await.unwrap();
+
+        // Larger than one frame payload packing room so each item is its own frame.
+        let payload = Value::Bytes(vec![b'z'; 7000]);
+        let items: Vec<(String, Value)> = (0..80)
+            .map(|i| (format!("bk{i}"), payload.clone()))
+            .collect();
+        wal.batch_write_operations(&items).await.unwrap();
+
+        let entries = wal.read_entries_from_disk().await.unwrap();
+        assert_eq!(entries.len(), 80);
+    }
+
+    #[tokio::test]
+    async fn indexed_wal_recovery_after_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let mut cfg = WalConfig::default();
+        cfg.dir = wal_dir.clone();
+        cfg.sync_mode = WalSyncMode::Fsync;
+        cfg.indexed_frame_count = 64;
+
+        {
+            let wal = IndexedWalManager::new(&cfg).unwrap();
+            wal.initialize().await.unwrap();
+            let payload = Value::Bytes(vec![b'r'; 256]);
+            for i in 0..80 {
+                wal.write_operation(&format!("rk{i}"), &payload)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let wal2 = IndexedWalManager::new(&cfg).unwrap();
+        wal2.initialize().await.unwrap();
+        let entries = wal2.read_entries_from_disk().await.unwrap();
+        assert_eq!(entries.len(), 80, "all puts across rotated segments must recover");
     }
 }

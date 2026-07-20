@@ -369,7 +369,6 @@ struct GroupCommitQueue {
 /// Background group-commit flusher (time/size triggered).
 struct GroupCommitFlusher {
     queue: Arc<Mutex<GroupCommitQueue>>,
-    commit_notify: Arc<Notify>,
     current_segment: Arc<RwLock<Option<WALSegment>>>,
     segments: Arc<RwLock<HashMap<u64, PathBuf>>>,
     segment_counter: Arc<std::sync::atomic::AtomicU64>,
@@ -864,6 +863,10 @@ impl WALManager {
             return Ok(all_entries);
         }
 
+        let mut segment_files_found = 0usize;
+        let mut segments_read_ok = 0usize;
+        let mut read_errors = Vec::new();
+
         if let Ok(entries) = std::fs::read_dir(&self.wal_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -873,18 +876,44 @@ impl WALManager {
                 if !file_name.ends_with(".wal") || !file_name.starts_with("segment_") {
                     continue;
                 }
-                if let Ok(mut segment) = WALSegment::open_for_reading(
-                    path,
+                segment_files_found += 1;
+                match WALSegment::open_for_reading(
+                    path.clone(),
                     self.config.segment_size as u64,
                     self.config.sync_mode,
                 )
                 .await
                 {
-                    if let Ok(entries) = segment.read_entries().await {
-                        all_entries.extend(entries);
+                    Ok(mut segment) => match segment.read_entries().await {
+                        Ok(entries) => {
+                            segments_read_ok += 1;
+                            all_entries.extend(entries);
+                        }
+                        Err(e) => {
+                            read_errors.push(format!("{file_name}: {e}"));
+                        }
+                    },
+                    Err(e) => {
+                        read_errors.push(format!("{file_name}: {e}"));
                     }
                 }
             }
+        }
+
+        if segment_files_found > 0 && segments_read_ok == 0 {
+            return Err(LsmError::Wal(format!(
+                "Failed to recover from {} WAL segment(s): {}",
+                segment_files_found,
+                read_errors.join("; ")
+            )));
+        }
+
+        if !read_errors.is_empty() {
+            warn!(
+                "Skipped {} corrupted WAL segment(s) during recovery: {}",
+                read_errors.len(),
+                read_errors.join("; ")
+            );
         }
 
         all_entries.sort_by_key(|e| match e {
@@ -1276,7 +1305,6 @@ impl WALManager {
         let commit_task = tokio::spawn(async move {
             let manager = GroupCommitFlusher {
                 queue: queue.clone(),
-                commit_notify: commit_notify.clone(),
                 current_segment,
                 segments,
                 segment_counter,

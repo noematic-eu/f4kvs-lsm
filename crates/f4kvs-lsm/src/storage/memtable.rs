@@ -152,6 +152,13 @@ impl Memtable {
             let mut size = self.size.write().await;
             if let Some(old_value) = old_value {
                 *size = size.saturating_sub(key_size + Self::estimate_value_size(&old_value));
+            } else {
+                // Tombstone for a key not currently in this memtable (e.g. live
+                // value already flushed to an SSTable). Must count as an entry
+                // so flush_memtable does not treat the memtable as empty and
+                // discard the tombstone — that resurrects the SSTable value.
+                let mut count = self.entry_count.write().await;
+                *count += 1;
             }
             // Add size for tombstone marker
             *size += key_size + 1; // Value::Null is roughly 1 byte

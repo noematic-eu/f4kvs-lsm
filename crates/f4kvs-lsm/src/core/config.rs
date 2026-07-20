@@ -88,6 +88,20 @@ impl Default for MemtableConfig {
     }
 }
 
+/// Strategy for random-access reads from SSTable files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SstableReadMode {
+    /// `seek` + `read` with an exclusive async file lock (legacy behaviour).
+    SeekRead,
+    /// Positioned reads via `pread` / `read_at` — concurrent reads without seek.
+    #[default]
+    PositionedRead,
+    /// `mmap` + `mincore` hybrid for hot pages (Linux only).
+    /// Falls back to [`SstableReadMode::PositionedRead`] on other platforms.
+    MmapHybrid,
+}
+
 /// SSTable configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SstableConfig {
@@ -111,6 +125,12 @@ pub struct SstableConfig {
 
     /// Enable resilient file handling (auto-reopen closed files)
     pub enable_resilient_handling: bool,
+
+    /// Random-access read strategy for SSTable files.
+    pub read_mode: SstableReadMode,
+
+    /// TTL for the `mincore` residency bitmap cache (seconds, `MmapHybrid` only).
+    pub mincore_cache_ttl_secs: u64,
 }
 
 impl Default for SstableConfig {
@@ -123,6 +143,8 @@ impl Default for SstableConfig {
             file_retry_attempts: 3,
             retry_delay_ms: 100,
             enable_resilient_handling: true,
+            read_mode: SstableReadMode::default(),
+            mincore_cache_ttl_secs: 60,
         }
     }
 }
@@ -649,15 +671,12 @@ impl LsmConfig {
         }
 
         // Validate performance configuration
-        // Note: LSM performance validation temporarily disabled due to type confusion
-        // TODO: Re-enable after resolving PerformanceConfig type issues
-        // if self.performance.max_parallel_reads == 0 {
-        //     errors.push("performance.max_parallel_reads must be greater than 0".to_string());
-        // }
-        //
-        // if self.performance.enable_parallel_reads && self.performance.max_parallel_reads > 100 {
-        //     errors.push("performance.max_parallel_reads should not exceed 100".to_string());
-        // }
+        if self.performance.max_parallel_reads == 0 {
+            errors.push("performance.max_parallel_reads must be greater than 0".to_string());
+        } else if self.performance.enable_parallel_reads && self.performance.max_parallel_reads > 100
+        {
+            errors.push("performance.max_parallel_reads should not exceed 100".to_string());
+        }
 
         if errors.is_empty() {
             Ok(())

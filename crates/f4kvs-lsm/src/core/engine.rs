@@ -37,6 +37,26 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// RAII guard that prevents LRU eviction from closing an SSTable during a read.
+struct SstableReadPin {
+    sstables: Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
+    level: usize,
+    idx: usize,
+}
+
+impl Drop for SstableReadPin {
+    fn drop(&mut self) {
+        if let Ok(sstables) = self.sstables.try_read() {
+            if let Some(sstable) = sstables
+                .get(&self.level)
+                .and_then(|level_sstables| level_sstables.get(self.idx))
+            {
+                sstable.unpin_reader();
+            }
+        }
+    }
+}
+
 #[cfg(feature = "metrics")]
 use crate::metrics::MetricsRecorder;
 #[cfg(feature = "metrics")]
@@ -328,17 +348,18 @@ impl LsmTreeEngine {
     /// Initialize WAL and perform recovery if needed
     async fn initialize_wal(&self) -> Result<()> {
         if self.config.wal.enabled {
-            info!("WAL is enabled, initializing...");
-            {
-                let wal = self.wal_manager.write().await;
-                wal.initialize()
-                    .await
-                    .map_err(|e| LsmError::Wal(format!("Failed to initialize WAL: {}", e)))?;
-            }
-            info!("WAL initialized, attempting recovery...");
+            info!("WAL is enabled, preparing for recovery...");
 
-            // Recover from WAL on startup (must not hold wal write lock — recovery reads wal)
-            // CRITICAL: WAL recovery failures must prevent startup unless explicitly allowed
+            // Ensure WAL directory exists before scanning on-disk segments for recovery.
+            // Recovery must run before `initialize()` creates a fresh segment, otherwise a
+            // newly created empty segment can mask pre-existing corrupted WAL files.
+            if !self.config.wal.dir.exists() {
+                tokio::fs::create_dir_all(&self.config.wal.dir)
+                    .await
+                    .map_err(LsmError::Io)?;
+            }
+
+            info!("Attempting WAL recovery from on-disk segments...");
             match self.recover_from_wal().await {
                 Ok(()) => {
                     info!("WAL recovery completed successfully");
@@ -351,7 +372,6 @@ impl LsmTreeEngine {
                             e
                         );
                     } else {
-                        // Default behavior: fail engine initialization on recovery failure
                         return Err(LsmError::Wal(format!(
                             "CRITICAL: WAL recovery failed, refusing to start engine. \
                             Recent writes may be lost if recovery cannot complete. \
@@ -364,6 +384,15 @@ impl LsmTreeEngine {
                     }
                 }
             }
+
+            info!("Initializing WAL for new writes...");
+            {
+                let wal = self.wal_manager.write().await;
+                wal.initialize()
+                    .await
+                    .map_err(|e| LsmError::Wal(format!("Failed to initialize WAL: {}", e)))?;
+            }
+            info!("WAL initialized");
         } else {
             info!("WAL is disabled");
         }
@@ -497,24 +526,25 @@ impl LsmTreeEngine {
         let entries = match recovery_result {
             Ok(Ok(entries)) => entries,
             Ok(Err(e)) => {
-                // Failed to read WAL entries - this is a real error that should be propagated
-                // Clear corrupted WAL files as cleanup
-                if let Err(clear_err) = self.clear_wal_directory().await {
-                    warn!(
-                        "Failed to clear WAL directory during recovery error cleanup: {}",
-                        clear_err
-                    );
-                } else {
-                    // WAL files were cleared successfully, return Ok(()) to continue without recovery
+                if self.config.wal.allow_recovery_failure {
+                    if let Err(clear_err) = self.clear_wal_directory().await {
+                        warn!(
+                            "Failed to clear WAL directory during recovery error cleanup: {}",
+                            clear_err
+                        );
+                        return Err(LsmError::Wal(format!(
+                            "Failed to read WAL entries during recovery: {}. \
+                            Additionally failed to clear corrupted WAL: {}",
+                            e, clear_err
+                        )));
+                    }
                     info!(
                         "WAL was cleared due to corruption/errors, continuing without WAL recovery"
                     );
                     return Ok(());
                 }
-                // Return error if we couldn't clear the WAL
                 return Err(LsmError::Wal(format!(
-                    "Failed to read WAL entries during recovery: {}. \
-                    Corrupted WAL files have been cleared.",
+                    "Failed to read WAL entries during recovery: {}",
                     e
                 )));
             }
@@ -718,6 +748,7 @@ impl LsmTreeEngine {
         if self.config.compaction.background_enabled {
             let compaction_manager = self.compaction_manager.clone();
             let sstables = self.sstables.clone();
+            let operation_guard = self.operation_guard.clone();
             let compaction_interval = self.config.compaction.interval;
             let shutdown = shutdown.clone();
 
@@ -729,6 +760,13 @@ impl LsmTreeEngine {
                             if shutdown.load(Ordering::Relaxed) {
                                 debug!("Background compaction task shutting down");
                                 break;
+                            }
+                            // Skip when foreground operations hold the guard; do not keep the
+                            // write lock during compaction (that would block all reads/writes
+                            // for the full compaction duration).
+                            if operation_guard.try_write().is_err() {
+                                debug!("Skipping background compaction - operations in progress");
+                                continue;
                             }
                             if let Err(e) = compaction_manager.compact_if_needed(&sstables).await {
                                 warn!("Background compaction failed: {}", e);
@@ -1046,13 +1084,15 @@ impl LsmTreeEngine {
         // This ensures SSTable entries are already sorted, improving read performance
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Generate unique SSTable filename
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| LsmError::Internal(format!("Failed to get timestamp: {}", e)))?
-            .as_millis();
+        // Generate unique SSTable filename. Millisecond timestamps collide under
+        // rapid flushes (force_durable puts + immediate delete flush), which
+        // overwrites the prior L0 file while the old SSTable handle still
+        // holds the previous index — resurrecting deleted keys on read.
+        let seq = self
+            .sequence_number
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sstable_path =
-            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", timestamp));
+            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", seq));
 
         // Create SSTable
         let mut sstable = SSTable::new(sstable_path, self.config.sstable.clone(), 0)?;
@@ -1063,13 +1103,13 @@ impl LsmTreeEngine {
         let sstable_entries: Vec<SSTableEntry> = entries
             .into_iter()
             .map(|(key, value, deleted)| {
-                let seq = self
+                let entry_seq = self
                     .sequence_number
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 SSTableEntry {
                     key,
                     value,
-                    timestamp: seq,
+                    timestamp: entry_seq,
                     deleted,
                 }
             })
@@ -1154,13 +1194,12 @@ impl LsmTreeEngine {
     /// Note: Reserved for future use in background compaction/flush operations
     #[allow(dead_code)]
     async fn flush_memtable_to_sstable(&self, memtable: Memtable) -> Result<()> {
-        // Generate unique SSTable filename
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| LsmError::Internal(format!("Failed to get timestamp: {}", e)))?
-            .as_millis();
+        // Unique filename via sequence (ms timestamps collide under rapid flushes).
+        let seq = self
+            .sequence_number
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sstable_path =
-            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", timestamp));
+            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", seq));
 
         // Create SSTable
         let mut sstable = SSTable::new(sstable_path, self.config.sstable.clone(), 0)?;
@@ -1286,16 +1325,28 @@ impl LsmTreeEngine {
         None
     }
 
-    /// Open an SSTable file if needed (brief write lock).
+    /// Pin an SSTable for reading so LRU eviction cannot close its file handle.
+    async fn pin_sstable_reader(&self, level: usize, idx: usize) -> Option<SstableReadPin> {
+        let sstables = self.sstables.read().await;
+        let sstable = sstables.get(&level)?.get(idx)?;
+        sstable.pin_reader();
+        Some(SstableReadPin {
+            sstables: Arc::clone(&self.sstables),
+            level,
+            idx,
+        })
+    }
+
+    /// Open an SSTable file if needed.
+    ///
+    /// Caller must hold an [`SstableReadPin`] so LRU eviction cannot close the file
+    /// between opening and reading.
     async fn ensure_sstable_open(&self, level: usize, idx: usize) {
         let _ = self.ensure_file_handle_capacity().await;
-        if let Ok(mut sstables) = self.sstables.try_write() {
-            if let Some(level_sstables) = sstables.get_mut(&level) {
-                if let Some(sstable) = level_sstables.get_mut(idx) {
-                    if !sstable.is_open() {
-                        let _ = sstable.ensure_file_open().await;
-                    }
-                }
+        let sstables = self.sstables.read().await;
+        if let Some(level_sstables) = sstables.get(&level) {
+            if let Some(sstable) = level_sstables.get(idx) {
+                let _ = sstable.ensure_file_open().await;
             }
         }
     }
@@ -1371,8 +1422,14 @@ impl LsmTreeEngine {
         Ok(merged.into_iter().collect())
     }
 
-    /// Get value from SSTables (slow path)
+    /// Get value from SSTables (slow path).
+    ///
+    /// L0 files may overlap; they are probed newest-first. A tombstone in a
+    /// newer file must stop the search — collapsing it to "miss" and reading
+    /// an older live value resurrects deleted keys after memtable flush.
     async fn get_from_sstables(&self, key: &str) -> Result<Option<Value>> {
+        use crate::storage::sstable::SstableLookupResult;
+
         for level in 0..self.config.levels.count {
             let candidate_indices: Vec<usize> = {
                 let sstables = self.sstables.read().await;
@@ -1393,6 +1450,9 @@ impl LsmTreeEngine {
             };
 
             for idx in candidate_indices {
+                let Some(_read_pin) = self.pin_sstable_reader(level, idx).await else {
+                    continue;
+                };
                 self.ensure_sstable_open(level, idx).await;
                 let sstables = self.sstables.read().await;
                 let Some(sstable) = sstables
@@ -1404,9 +1464,10 @@ impl LsmTreeEngine {
                 let sstable = &*sstable;
                 #[cfg(feature = "metrics")]
                 record_sstable_read(&self.metrics);
-                match sstable.get(key, Some(&self.block_cache)).await {
-                    Ok(Some(value)) => return Ok(Some(value)),
-                    Ok(None) => {}
+                match sstable.lookup_pinned(key, Some(&self.block_cache)).await {
+                    Ok(SstableLookupResult::Found(value)) => return Ok(Some(value)),
+                    Ok(SstableLookupResult::Tombstone) => return Ok(None),
+                    Ok(SstableLookupResult::Missing) => {}
                     Err(e) => debug!("Error reading from SSTable L{level}[{idx}]: {e}"),
                 }
             }
@@ -1429,7 +1490,10 @@ impl LsmTreeEngine {
             for (idx, sstable) in level_sstables.iter().enumerate() {
                 if sstable.is_open() {
                     open_count += 1;
-                    sstable_access_times.push((*level, idx, sstable.last_access()));
+                    // Never evict files with active readers — closing mid-read causes None/errors.
+                    if sstable.can_delete() {
+                        sstable_access_times.push((*level, idx, sstable.last_access()));
+                    }
                 }
             }
         }
@@ -1448,7 +1512,7 @@ impl LsmTreeEngine {
             for (level, idx, _) in sstable_access_times.iter().take(to_close) {
                 if let Some(level_sstables) = sstables.get_mut(level) {
                     if let Some(sstable) = level_sstables.get_mut(*idx) {
-                        if sstable.is_open() {
+                        if sstable.is_open() && sstable.can_delete() {
                             sstable.close().await?;
                             closed += 1;
                         }
@@ -1700,17 +1764,26 @@ impl StorageEngine for LsmTreeEngine {
             }
         }
 
-        // Check memtables first
-        if self
+        // Check memtables first (including tombstones — a delete must not
+        // fall through to an older SSTable live value).
+        match self
             .get_from_memtables(key)
             .await
             .map_err(Self::convert_error)?
-            .is_some()
         {
-            return Ok(true);
+            Some(_) => return Ok(true),
+            None => {
+                if self
+                    .has_tombstone_in_memtables(key)
+                    .await
+                    .map_err(Self::convert_error)?
+                {
+                    return Ok(false);
+                }
+            }
         }
 
-        // Check SSTables
+        // Check SSTables (get_from_sstables already honours L0 tombstones)
         if self
             .get_from_sstables(key)
             .await
