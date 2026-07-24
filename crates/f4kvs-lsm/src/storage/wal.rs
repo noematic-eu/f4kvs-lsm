@@ -1147,7 +1147,14 @@ impl WALManager {
         self.batch_write_entries(&entries).await
     }
 
-    /// Internal method to write multiple entries in batch
+    /// Internal method to write multiple entries in batch.
+    ///
+    /// **Locking:** never call [`Self::rotate_segment`] while holding
+    /// `current_segment` write guard. A previous bug did
+    /// `let segment = guard.as_mut()?; …; let _ = segment; rotate()` — that only
+    /// dropped the `&mut` reborrow, not the `RwLockWriteGuard`, so rotation
+    /// deadlocked on the same task (observed ~13–15k × 4 KiB batch puts when the
+    /// default 64 MiB segment filled). Match frame WAL: `drop(guard)` then rotate.
     async fn batch_write_entries(&self, entries: &[WALEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -1155,35 +1162,7 @@ impl WALManager {
 
         tracing::debug!("WAL: Starting batch write of {} entries", entries.len());
 
-        // Check if we need to rotate first
-        {
-            let current_segment = self.current_segment.read().await;
-            if let Some(segment) = current_segment.as_ref() {
-                if segment.should_rotate().await? {
-                    tracing::info!("WAL: Rotating segment before batch write");
-                    // current_segment is automatically dropped here
-                    self.rotate_segment().await?;
-                }
-            }
-        } // current_segment is dropped here
-
-        // Get current segment after potential rotation
-        let mut current_segment = self.current_segment.write().await;
-        let current_segment = current_segment.as_mut().ok_or_else(|| {
-            tracing::error!("WAL: No current WAL segment available for batch write");
-            LsmError::Internal("No current WAL segment".to_string())
-        })?;
-
-        tracing::debug!("WAL: Got current segment for batch write");
-
-        // Seek to end of file
-        current_segment
-            .file
-            .seek(tokio::io::SeekFrom::End(0))
-            .await
-            .map_err(LsmError::Io)?;
-
-        // Prepare all data to write in one go
+        // Serialize outside the segment lock.
         let mut data_to_write = Vec::new();
         for entry in entries {
             let entry_data = bincode::serialize(entry).map_err(|e| {
@@ -1199,68 +1178,57 @@ impl WALManager {
             data_to_write.len()
         );
 
-        // CRITICAL FIX: Check if the batch write would exceed segment size
-        // If so, we need to split the batch or rotate the segment
-        let current_size = current_segment
-            .file
-            .metadata()
-            .await
-            .map_err(LsmError::Io)?
-            .len();
-        let max_size = current_segment.max_size;
+        // Rotate if the open segment is already at capacity (read path).
+        {
+            let current_segment = self.current_segment.read().await;
+            if let Some(segment) = current_segment.as_ref() {
+                if segment.should_rotate().await? {
+                    tracing::info!("WAL: Rotating segment before batch write");
+                    drop(current_segment);
+                    self.rotate_segment().await?;
+                }
+            }
+        }
 
-        if current_size + data_to_write.len() as u64 > max_size {
-            tracing::info!(
-                "WAL: Batch write would exceed segment size ({} + {} > {}), rotating segment",
-                current_size,
-                data_to_write.len(),
-                max_size
-            );
+        // If this batch would overflow the current file, rotate first.
+        // Must release the write guard before rotate_segment (it takes write again).
+        let needs_rotate = {
+            let guard = self.current_segment.write().await;
+            let segment = guard.as_ref().ok_or_else(|| {
+                tracing::error!("WAL: No current WAL segment available for batch write");
+                LsmError::Internal("No current WAL segment".to_string())
+            })?;
+            let current_size = segment.file.metadata().await.map_err(LsmError::Io)?.len();
+            let overflow = current_size + data_to_write.len() as u64 > segment.max_size;
+            if overflow {
+                tracing::info!(
+                    "WAL: Batch write would exceed segment size ({} + {} > {}), rotating segment",
+                    current_size,
+                    data_to_write.len(),
+                    segment.max_size
+                );
+            }
+            overflow
+        }; // write guard dropped here
 
-            // Drop the current segment lock
-            let _ = current_segment;
-
-            // Rotate to new segment
+        if needs_rotate {
             self.rotate_segment().await?;
+        }
 
-            // Get the new segment and complete the write operation
-            let mut current_segment = self.current_segment.write().await;
-            let current_segment = current_segment.as_mut().ok_or_else(|| {
-                tracing::error!("WAL: Failed to get new segment after rotation");
-                LsmError::Internal("Failed to create new WAL segment".to_string())
+        // Append + single sync on the (possibly new) segment.
+        {
+            let mut guard = self.current_segment.write().await;
+            let segment = guard.as_mut().ok_or_else(|| {
+                tracing::error!("WAL: No current WAL segment available after rotation");
+                LsmError::Internal("No current WAL segment".to_string())
             })?;
 
-            // Seek to end of new segment
-            current_segment
+            segment
                 .file
                 .seek(tokio::io::SeekFrom::End(0))
                 .await
                 .map_err(LsmError::Io)?;
-
-            // Write all data to new segment
-            current_segment
-                .file
-                .write_all(&data_to_write)
-                .await
-                .map_err(LsmError::Io)?;
-            tracing::debug!(
-                "WAL: Successfully wrote {} bytes to new segment",
-                data_to_write.len()
-            );
-
-            // Update counts
-            current_segment.entry_count += entries.len() as u32;
-            current_segment.header.entry_count = current_segment.entry_count;
-            tracing::debug!(
-                "WAL: Updated entry count to {}",
-                current_segment.entry_count
-            );
-
-            // Update header and sync once for the whole batch
-            current_segment.sync_header_and_flush().await?;
-        } else {
-            // Write all data to current segment
-            current_segment
+            segment
                 .file
                 .write_all(&data_to_write)
                 .await
@@ -1270,16 +1238,9 @@ impl WALManager {
                 data_to_write.len()
             );
 
-            // Update counts
-            current_segment.entry_count += entries.len() as u32;
-            current_segment.header.entry_count = current_segment.entry_count;
-            tracing::debug!(
-                "WAL: Updated entry count to {}",
-                current_segment.entry_count
-            );
-
-            // Update header and sync once for the whole batch
-            current_segment.sync_header_and_flush().await?;
+            segment.entry_count += entries.len() as u32;
+            segment.header.entry_count = segment.entry_count;
+            segment.sync_header_and_flush().await?;
         }
 
         Ok(())
@@ -1440,5 +1401,73 @@ impl WALManager {
 
         tracing::info!("WAL: Clean shutdown marked successfully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod batch_rotate_tests {
+    use super::*;
+    use crate::core::config::{WalConfig, WalSyncMode};
+    use f4kvs_value::Value;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    /// Repro of meso hang: batch_write across a full segment must not deadlock.
+    /// Pre-fix: `let _ = segment_ref` left the write guard held → rotate waited forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_write_rotates_when_segment_full_no_deadlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = WalConfig::default();
+        cfg.dir = dir.path().join("wal");
+        cfg.engine = crate::core::config::WalEngine::Segment;
+        cfg.sync_mode = WalSyncMode::Fsync;
+        // Small segment so a few 4KiB batches force rotation quickly.
+        cfg.segment_size = 256 * 1024; // 256 KiB
+        cfg.group_commit_enabled = false;
+
+        let wal = WALManager::new(&cfg).expect("wal new");
+        wal.initialize().await.expect("wal init");
+
+        let payload = Value::Bytes(vec![b'x'; 4 * 1024]);
+        let batch_size = 20;
+        let batches = 40; // well past 256 KiB of payload
+
+        let work = async {
+            for b in 0..batches {
+                let items: Vec<(String, Value)> = (0..batch_size)
+                    .map(|i| {
+                        let k = format!("chunk:{:05}:{:03}", b, i);
+                        (k, payload.clone())
+                    })
+                    .collect();
+                wal.batch_write_operations(&items)
+                    .await
+                    .unwrap_or_else(|e| panic!("batch {b} failed: {e}"));
+            }
+        };
+
+        timeout(Duration::from_secs(30), work)
+            .await
+            .expect("batch_write across segment rotation hung (write-lock deadlock)");
+
+        let entries = wal.read_entries_from_disk().await.expect("read");
+        assert_eq!(entries.len(), batch_size * batches);
+
+        // More than one segment file should exist after rotation.
+        let seg_count = std::fs::read_dir(&cfg.dir)
+            .expect("read wal dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("segment_") && n.ends_with(".wal"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            seg_count >= 2,
+            "expected multiple WAL segments after overflow, got {seg_count}"
+        );
     }
 }
