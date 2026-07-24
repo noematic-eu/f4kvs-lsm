@@ -12,6 +12,10 @@ publish = false
 name = "f4kvs-trimmed-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "fair-vs-sqlite"
+path = "src/bin/fair_vs_sqlite.rs"
+
 [dependencies]
 f4kvs-lsm = { workspace = true }
 f4kvs-storage-core = { workspace = true }
@@ -21,3 +25,6 @@ tempfile = { workspace = true }
 fastrand = "2.0"
 walkdir = "2.5"
 byte-unit = "5.1"
+# Fair meso peer (same machine, no FFI) — optional feature always on for this crate
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = { workspace = true }
