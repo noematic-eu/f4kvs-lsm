@@ -37,6 +37,28 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Parse LSM level from an on-disk SSTable filename.
+///
+/// Accepts both flush and compaction naming schemes:
+/// - `L{level}_{hex_seq}.sst` (flush path)
+/// - `sstable_l{level}_t{unix_ts}.sst` (compaction path)
+fn parse_sstable_level_from_filename(file_name: &str) -> Option<usize> {
+    if !file_name.ends_with(".sst") {
+        return None;
+    }
+    // Compaction: sstable_l0_t1234567890.sst
+    if let Some(rest) = file_name.strip_prefix("sstable_l") {
+        let level_str = rest.split('_').next()?;
+        return level_str.parse::<usize>().ok();
+    }
+    // Flush: L0_0000000000006ddd.sst (must start with L + digit, not "L" alone)
+    if file_name.starts_with('L') {
+        let level_str = file_name.split('_').next()?;
+        return level_str.strip_prefix('L')?.parse::<usize>().ok();
+    }
+    None
+}
+
 /// RAII guard that prevents LRU eviction from closing an SSTable during a read.
 struct SstableReadPin {
     sstables: Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
@@ -417,52 +439,39 @@ impl LsmTreeEngine {
         let mut sstables = self.sstables.write().await;
         let mut loaded_count = 0;
 
-        // Scan for SSTable files (pattern: L{level}_{timestamp}.sst)
+        // Scan for SSTable files. Two historical naming schemes coexist:
+        //   1. Flush path:   L{level}_{hex_seq}.sst          (e.g. L0_0000000000006ddd.sst)
+        //   2. Compaction:   sstable_l{level}_t{unix_ts}.sst (e.g. sstable_l0_t1785744634.sst)
+        // Recovery used to only accept (1), so compacted files were invisible after restart —
+        // observed on the full-tier soak gate: anchors lived only in sstable_l0_t* and
+        // returned 404 post-restart despite being on disk (see f4kvs-v2 soak-20260803T080810Z).
         if let Ok(entries) = std::fs::read_dir(data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
                     log::trace!("Found file: {}", file_name);
-                    if file_name.ends_with(".sst") && file_name.starts_with("L") {
-                        log::trace!("Processing SSTable file: {}", file_name);
-                        // Parse level from filename (e.g., "L0_1234567890.sst")
-                        if let Some(level_str) = file_name.split('_').next() {
-                            if let Some(level) = level_str
-                                .strip_prefix("L")
-                                .and_then(|s| s.parse::<usize>().ok())
-                            {
-                                log::trace!("Parsed level: {}", level);
-                                // Create SSTable and try to open it
-                                if let Ok(mut sstable) =
-                                    SSTable::new(path.clone(), self.config.sstable.clone(), level)
-                                {
-                                    log::trace!("Created SSTable for level {}", level);
-                                    match sstable.open().await {
-                                        Ok(()) => {
-                                            let level_sstables =
-                                                sstables.entry(level).or_insert_with(Vec::new);
-                                            level_sstables.push(sstable);
-                                            loaded_count += 1;
-                                            info!(
-                                                "Loaded SSTable: {} (level {})",
-                                                file_name, level
-                                            );
-                                            log::debug!(
-                                                "Successfully loaded SSTable: {} (level {})",
-                                                file_name,
-                                                level
-                                            );
-                                        }
-                                        Err(_) => {
-                                            warn!("Failed to open SSTable: {}", file_name);
-                                            log::debug!("Failed to open SSTable: {}", file_name);
-                                        }
-                                    }
-                                } else {
-                                    log::debug!("Failed to create SSTable for file: {}", file_name);
-                                }
+                    let level = match parse_sstable_level_from_filename(file_name) {
+                        Some(level) => level,
+                        None => continue,
+                    };
+                    log::trace!("Processing SSTable file: {} (level {})", file_name, level);
+                    if let Ok(mut sstable) =
+                        SSTable::new(path.clone(), self.config.sstable.clone(), level)
+                    {
+                        match sstable.open().await {
+                            Ok(()) => {
+                                let level_sstables =
+                                    sstables.entry(level).or_insert_with(Vec::new);
+                                level_sstables.push(sstable);
+                                loaded_count += 1;
+                                info!("Loaded SSTable: {} (level {})", file_name, level);
+                            }
+                            Err(_) => {
+                                warn!("Failed to open SSTable: {}", file_name);
                             }
                         }
+                    } else {
+                        log::debug!("Failed to create SSTable for file: {}", file_name);
                     }
                 }
             }
@@ -5092,5 +5101,31 @@ mod tests {
         // Delete non-existent key (should succeed)
         let result = engine.delete("nonexistent_key").await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_sstable_level_from_filename() {
+        // Flush path
+        assert_eq!(
+            parse_sstable_level_from_filename("L0_0000000000006ddd.sst"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_sstable_level_from_filename("L03_0000000000000001.sst"),
+            Some(3)
+        );
+        // Compaction path (must not be ignored on recovery)
+        assert_eq!(
+            parse_sstable_level_from_filename("sstable_l0_t1785744634.sst"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_sstable_level_from_filename("sstable_l2_t100.sst"),
+            Some(2)
+        );
+        // Non-SST / unrelated
+        assert_eq!(parse_sstable_level_from_filename("wal_segment.log"), None);
+        assert_eq!(parse_sstable_level_from_filename("MANIFEST"), None);
+        assert_eq!(parse_sstable_level_from_filename("sstable.sst"), None);
     }
 }
