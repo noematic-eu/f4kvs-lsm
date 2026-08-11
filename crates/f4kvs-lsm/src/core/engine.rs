@@ -59,6 +59,23 @@ fn parse_sstable_level_from_filename(file_name: &str) -> Option<usize> {
     None
 }
 
+/// Parse the flush-path sequence number from `L{level}_{hex_seq}.sst`.
+///
+/// Compaction-named files (`sstable_l*_t*`) return `None` — they do not share
+/// the flush sequence counter. Used on recovery so the in-memory
+/// `sequence_number` never reuses a filename that already exists on disk
+/// (which would silently overwrite live SSTables and drop keys).
+fn parse_sstable_flush_sequence_from_filename(file_name: &str) -> Option<u64> {
+    if !file_name.ends_with(".sst") || !file_name.starts_with('L') {
+        return None;
+    }
+    // L0_0000000000006ddd.sst → ("L0", "0000000000006ddd.sst")
+    let rest = file_name.strip_prefix('L')?;
+    let (_level, seq_and_ext) = rest.split_once('_')?;
+    let seq_hex = seq_and_ext.strip_suffix(".sst")?;
+    u64::from_str_radix(seq_hex, 16).ok()
+}
+
 /// RAII guard that prevents LRU eviction from closing an SSTable during a read.
 struct SstableReadPin {
     sstables: Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
@@ -438,6 +455,10 @@ impl LsmTreeEngine {
 
         let mut sstables = self.sstables.write().await;
         let mut loaded_count = 0;
+        // Highest flush-path sequence seen on disk. After load we advance
+        // `sequence_number` past this so new L0_{seq}.sst names never collide
+        // with files still holding live data (soak crash-gate data loss 2026-08-11).
+        let mut max_flush_seq: u64 = 0;
 
         // Scan for SSTable files. Two historical naming schemes coexist:
         //   1. Flush path:   L{level}_{hex_seq}.sst          (e.g. L0_0000000000006ddd.sst)
@@ -450,6 +471,9 @@ impl LsmTreeEngine {
                 let path = entry.path();
                 if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
                     log::trace!("Found file: {}", file_name);
+                    if let Some(seq) = parse_sstable_flush_sequence_from_filename(file_name) {
+                        max_flush_seq = max_flush_seq.max(seq);
+                    }
                     let level = match parse_sstable_level_from_filename(file_name) {
                         Some(level) => level,
                         None => continue,
@@ -475,6 +499,26 @@ impl LsmTreeEngine {
                     }
                 }
             }
+        }
+
+        // sequence_number is shared for L0 filenames AND entry timestamps.
+        // Start at max_flush_seq+1 so the next fetch_add yields an unused id.
+        // If nothing on disk, leave at 0 (fresh engine).
+        //
+        // FIXME(durability): a flush of N entries consumes N+1 sequence numbers
+        // (1 filename + N entry timestamps), so after restart the counter resumes
+        // *below* the entry timestamps already persisted on disk. Compaction
+        // dedup picks winners by descending timestamp, which can resurrect a
+        // pre-restart value over a post-restart overwrite/delete. Proper fix:
+        // persist the high-water mark (MANIFEST/SEQUENCE file) or take the max
+        // of entry timestamps seen while loading SSTables.
+        if max_flush_seq > 0 || loaded_count > 0 {
+            let next = max_flush_seq.saturating_add(1);
+            self.sequence_number.store(next, Ordering::SeqCst);
+            info!(
+                "Advanced flush sequence_number to {} (max on-disk flush seq was {})",
+                next, max_flush_seq
+            );
         }
 
         log::debug!("Total SSTables loaded: {}", loaded_count);
@@ -1097,11 +1141,25 @@ impl LsmTreeEngine {
         // rapid flushes (force_durable puts + immediate delete flush), which
         // overwrites the prior L0 file while the old SSTable handle still
         // holds the previous index — resurrecting deleted keys on read.
-        let seq = self
-            .sequence_number
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let sstable_path =
-            PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", seq));
+        // Sequence is also advanced past on-disk max at load (see
+        // load_existing_sstables); still refuse to clobber an existing path.
+        let sstable_path = {
+            let mut path;
+            loop {
+                let seq = self
+                    .sequence_number
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                path = PathBuf::from(&self.config.data_dir).join(format!("L0_{:016x}.sst", seq));
+                if !path.exists() {
+                    break;
+                }
+                warn!(
+                    "L0 SSTable path already exists ({}), advancing sequence to avoid overwrite",
+                    path.display()
+                );
+            }
+            path
+        };
 
         // Create SSTable
         let mut sstable = SSTable::new(sstable_path, self.config.sstable.clone(), 0)?;
@@ -5128,5 +5186,163 @@ mod tests {
         assert_eq!(parse_sstable_level_from_filename("wal_segment.log"), None);
         assert_eq!(parse_sstable_level_from_filename("MANIFEST"), None);
         assert_eq!(parse_sstable_level_from_filename("sstable.sst"), None);
+    }
+
+    #[test]
+    fn test_parse_sstable_flush_sequence_from_filename() {
+        assert_eq!(
+            parse_sstable_flush_sequence_from_filename("L0_0000000000006ddd.sst"),
+            Some(0x6ddd)
+        );
+        assert_eq!(
+            parse_sstable_flush_sequence_from_filename("L0_0000000000000000.sst"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_sstable_flush_sequence_from_filename("L2_00000000000000ff.sst"),
+            Some(0xff)
+        );
+        // Compaction names do not carry the flush sequence counter
+        assert_eq!(
+            parse_sstable_flush_sequence_from_filename("sstable_l0_t1785744634.sst"),
+            None
+        );
+        assert_eq!(
+            parse_sstable_flush_sequence_from_filename("not_an_sst.txt"),
+            None
+        );
+    }
+
+    /// Regression: after restart the flush sequence must continue past on-disk
+    /// L0_* filenames. Restarting at 0 overwrote live SSTables (soak crash-gate
+    /// lost 52/100 pre-existing verify keys while writing a new burst).
+    #[tokio::test]
+    async fn test_restart_does_not_overwrite_existing_l0_sstables() {
+        use std::collections::HashMap;
+        use std::fs;
+
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            // Disable background compaction so L0 files stay put for the check.
+            compaction: CompactionConfig {
+                background_enabled: false,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        };
+
+        // Phase 1: write + flush a batch of keys so L0 files exist on disk.
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("create engine");
+            for i in 0..50 {
+                engine
+                    .put(
+                        &format!("persist:{i}"),
+                        &Value::Bytes(format!("v{i}").into_bytes()),
+                    )
+                    .await
+                    .expect("put");
+            }
+            engine.flush().await.expect("flush");
+            engine.shutdown().await.expect("shutdown");
+        }
+
+        let mut gen1: HashMap<String, u64> = HashMap::new();
+        for entry in fs::read_dir(&data_dir).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("L0_") && name.ends_with(".sst") {
+                gen1.insert(name, entry.metadata().expect("meta").len());
+            }
+        }
+        assert!(
+            !gen1.is_empty(),
+            "expected at least one L0 SSTable after first flush"
+        );
+
+        // Phase 2: reopen and flush more data. Must not clobber gen1 paths.
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("reopen engine");
+            // Sequence must sit past the on-disk max.
+            let max_on_disk = gen1
+                .keys()
+                .filter_map(|n| parse_sstable_flush_sequence_from_filename(n))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                engine.sequence_number.load(Ordering::SeqCst) > max_on_disk,
+                "sequence_number {} must be > max on-disk flush seq {}",
+                engine.sequence_number.load(Ordering::SeqCst),
+                max_on_disk
+            );
+
+            for i in 0..20 {
+                engine
+                    .put(
+                        &format!("new:{i}"),
+                        &Value::Bytes(format!("n{i}").into_bytes()),
+                    )
+                    .await
+                    .expect("put new");
+            }
+            engine.flush().await.expect("flush after restart");
+
+            // Pre-restart keys still readable
+            for i in 0..50 {
+                let v = engine
+                    .get(&format!("persist:{i}"))
+                    .await
+                    .expect("get")
+                    .expect("key missing after post-restart flush");
+                assert_eq!(v, Value::Bytes(format!("v{i}").into_bytes()));
+            }
+            engine.shutdown().await.expect("shutdown 2");
+        }
+
+        // On-disk: every gen1 file still present with unchanged size.
+        for (name, size) in &gen1 {
+            let path = data_dir.join(name);
+            assert!(
+                path.exists(),
+                "gen1 SSTable {name} was deleted or overwritten away"
+            );
+            let new_size = fs::metadata(&path).expect("meta").len();
+            assert_eq!(
+                new_size, *size,
+                "gen1 SSTable {name} size changed ({size} -> {new_size}); likely overwritten"
+            );
+        }
+
+        // At least one new L0 file with seq > max gen1
+        let max_gen1 = gen1
+            .keys()
+            .filter_map(|n| parse_sstable_flush_sequence_from_filename(n))
+            .max()
+            .unwrap_or(0);
+        let mut saw_newer = false;
+        for entry in fs::read_dir(&data_dir).expect("read_dir 2") {
+            let name = entry.expect("e").file_name().to_string_lossy().into_owned();
+            if let Some(seq) = parse_sstable_flush_sequence_from_filename(&name) {
+                if seq > max_gen1 {
+                    saw_newer = true;
+                }
+            }
+        }
+        assert!(
+            saw_newer,
+            "expected a new L0 SSTable with seq > {max_gen1} after post-restart flush"
+        );
     }
 }
