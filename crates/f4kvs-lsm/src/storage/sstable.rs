@@ -347,14 +347,23 @@ pub struct SSTableEntry {
 ///
 /// Distinguishes a tombstone (key was deleted in this file) from a pure miss
 /// (key never written in this file). Callers that merge multiple L0 files must
-/// stop on [`SstableLookupResult::Tombstone`] — treating a tombstone as
-/// `None` and continuing to older files resurrects deleted keys.
+/// pick the highest [`timestamp`] across candidates — treating a tombstone as
+/// `None` and continuing to older files resurrects deleted keys, and taking the
+/// first hit by file-vector order is wrong after restart (`read_dir` order).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SstableLookupResult {
-    /// Live value found
-    Found(Value),
-    /// Deletion tombstone — newer than any older SSTable value for this key
-    Tombstone,
+    /// Live value found (with entry timestamp for L0 multi-file merge)
+    Found {
+        /// Value payload
+        value: Value,
+        /// Monotonic entry timestamp (sequence number at flush)
+        timestamp: u64,
+    },
+    /// Deletion tombstone — wins over any older live value for this key
+    Tombstone {
+        /// Monotonic entry timestamp of the delete
+        timestamp: u64,
+    },
     /// Key not present in this SSTable
     Missing,
 }
@@ -925,8 +934,8 @@ impl SSTable {
         block_cache: Option<&SharedBlockCache>,
     ) -> Result<Option<Value>> {
         match self.lookup_pinned(key, block_cache).await? {
-            SstableLookupResult::Found(v) => Ok(Some(v)),
-            SstableLookupResult::Tombstone | SstableLookupResult::Missing => Ok(None),
+            SstableLookupResult::Found { value, .. } => Ok(Some(value)),
+            SstableLookupResult::Tombstone { .. } | SstableLookupResult::Missing => Ok(None),
         }
     }
 
@@ -951,8 +960,8 @@ impl SSTable {
             .lookup_with_reader_guard(key, block_cache, guard)
             .await?
         {
-            SstableLookupResult::Found(v) => Ok(Some(v)),
-            SstableLookupResult::Tombstone | SstableLookupResult::Missing => Ok(None),
+            SstableLookupResult::Found { value, .. } => Ok(Some(value)),
+            SstableLookupResult::Tombstone { .. } | SstableLookupResult::Missing => Ok(None),
         }
     }
 
@@ -1119,9 +1128,14 @@ impl SSTable {
                     if entry.deleted {
                         // Tombstone must not be collapsed to Missing: L0 merge
                         // would otherwise fall through to an older live value.
-                        return Ok(SstableLookupResult::Tombstone);
+                        return Ok(SstableLookupResult::Tombstone {
+                            timestamp: entry.timestamp,
+                        });
                     } else {
-                        return Ok(SstableLookupResult::Found(entry.value));
+                        return Ok(SstableLookupResult::Found {
+                            value: entry.value,
+                            timestamp: entry.timestamp,
+                        });
                     }
                 }
                 Err(e) => {

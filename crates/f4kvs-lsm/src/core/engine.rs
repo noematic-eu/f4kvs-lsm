@@ -76,6 +76,10 @@ fn parse_sstable_flush_sequence_from_filename(file_name: &str) -> Option<u64> {
     u64::from_str_radix(seq_hex, 16).ok()
 }
 
+/// On-disk high-water mark for `sequence_number` (entry timestamps + L0 ids).
+/// Plain decimal text so operators can inspect it; written atomically via rename.
+const SEQUENCE_FILE_NAME: &str = "SEQUENCE";
+
 /// RAII guard that prevents LRU eviction from closing an SSTable during a read.
 struct SstableReadPin {
     sstables: Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
@@ -502,22 +506,46 @@ impl LsmTreeEngine {
         }
 
         // sequence_number is shared for L0 filenames AND entry timestamps.
-        // Start at max_flush_seq+1 so the next fetch_add yields an unused id.
-        // If nothing on disk, leave at 0 (fresh engine).
-        //
-        // FIXME(durability): a flush of N entries consumes N+1 sequence numbers
-        // (1 filename + N entry timestamps), so after restart the counter resumes
-        // *below* the entry timestamps already persisted on disk. Compaction
-        // dedup picks winners by descending timestamp, which can resurrect a
-        // pre-restart value over a post-restart overwrite/delete. Proper fix:
-        // persist the high-water mark (MANIFEST/SEQUENCE file) or take the max
-        // of entry timestamps seen while loading SSTables.
-        if max_flush_seq > 0 || loaded_count > 0 {
-            let next = max_flush_seq.saturating_add(1);
+        // A flush of N entries consumes N+1 sequence numbers (1 filename + N
+        // timestamps). Resuming only past max *filename* seq leaves the counter
+        // below on-disk entry timestamps → compaction can resurrect older values
+        // over post-restart overwrites/deletes. High-water = max of:
+        //   - flush-path filename sequences
+        //   - entry timestamps inside loaded SSTables
+        //   - durable SEQUENCE file (survives if a crash skips a scan path)
+        let mut max_entry_ts: u64 = 0;
+        for level_sstables in sstables.values() {
+            for sstable in level_sstables {
+                match sstable.get_all_entries().await {
+                    Ok(entries) => {
+                        for e in entries {
+                            max_entry_ts = max_entry_ts.max(e.timestamp);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Could not scan timestamps in {:?}: {} (using SEQUENCE file fallback)",
+                            sstable.path(),
+                            err
+                        );
+                    }
+                }
+            }
+        }
+        let seq_file_hw = self.load_sequence_file().await.unwrap_or(0);
+        let high_water = max_flush_seq.max(max_entry_ts).max(seq_file_hw);
+
+        if high_water > 0 || loaded_count > 0 {
+            let next = high_water.saturating_add(1);
             self.sequence_number.store(next, Ordering::SeqCst);
+            // Persist so the next crash recovery has the watermark even if
+            // entry scans are skipped or incomplete.
+            if let Err(e) = self.persist_sequence_file(next).await {
+                warn!("Failed to persist SEQUENCE high-water mark: {}", e);
+            }
             info!(
-                "Advanced flush sequence_number to {} (max on-disk flush seq was {})",
-                next, max_flush_seq
+                "Advanced flush sequence_number to {} (max_flush_seq={}, max_entry_ts={}, sequence_file={})",
+                next, max_flush_seq, max_entry_ts, seq_file_hw
             );
         }
 
@@ -530,6 +558,70 @@ impl LsmTreeEngine {
 
         info!("Loaded {} existing SSTables from disk", loaded_count);
         Ok(())
+    }
+
+    /// Path of the durable sequence high-water file.
+    fn sequence_file_path(&self) -> PathBuf {
+        PathBuf::from(&self.config.data_dir).join(SEQUENCE_FILE_NAME)
+    }
+
+    /// Load the durable SEQUENCE high-water mark (0 if missing/unreadable).
+    async fn load_sequence_file(&self) -> Result<u64> {
+        let path = self.sequence_file_path();
+        if !path.exists() {
+            return Ok(0);
+        }
+        let text = tokio::fs::read_to_string(&path).await.map_err(LsmError::Io)?;
+        let value = text.trim().parse::<u64>().map_err(|e| {
+            LsmError::Corruption(format!(
+                "Invalid SEQUENCE file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Ok(value)
+    }
+
+    /// Atomically persist the sequence high-water mark (write temp + rename).
+    async fn persist_sequence_file(&self, value: u64) -> Result<()> {
+        let path = self.sequence_file_path();
+        let tmp = path.with_extension("tmp");
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(LsmError::Io)?;
+        }
+        tokio::fs::write(&tmp, format!("{}\n", value))
+            .await
+            .map_err(LsmError::Io)?;
+        // fsync the temp file so rename is durable across power loss.
+        {
+            let f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)
+                .await
+                .map_err(LsmError::Io)?;
+            f.sync_all().await.map_err(LsmError::Io)?;
+        }
+        tokio::fs::rename(&tmp, &path).await.map_err(LsmError::Io)?;
+        // Best-effort dir fsync on platforms that support it.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist current `sequence_number` as the durable high-water mark.
+    async fn persist_sequence_high_water(&self) {
+        let value = self.sequence_number.load(Ordering::SeqCst);
+        if value == 0 {
+            return;
+        }
+        if let Err(e) = self.persist_sequence_file(value).await {
+            warn!("Failed to persist SEQUENCE high-water {}: {}", value, e);
+        }
     }
 
     /// Recover from WAL on startup
@@ -1185,6 +1277,10 @@ impl LsmTreeEngine {
         // Write entries to SSTable (optimized with pre-sorted entries)
         sstable.write_entries(sstable_entries).await?;
 
+        // Durable high-water mark *before* the new SST is published, so a crash
+        // between write and open still advances recovery past these timestamps.
+        self.persist_sequence_high_water().await;
+
         // Open SSTable for reading - this reads metadata and index from the file
         // CRITICAL: The file must be fully written and synced before opening
         // (write_entries already does sync_all, so this should be safe)
@@ -1491,9 +1587,9 @@ impl LsmTreeEngine {
 
     /// Get value from SSTables (slow path).
     ///
-    /// L0 files may overlap; they are probed newest-first. A tombstone in a
-    /// newer file must stop the search — collapsing it to "miss" and reading
-    /// an older live value resurrects deleted keys after memtable flush.
+    /// L0 files may overlap. They are merged by **entry timestamp** (not by
+    /// vector / `read_dir` order): the highest-timestamp Found or Tombstone
+    /// wins. File-order-first-hit resurrects stale values after restart.
     async fn get_from_sstables(&self, key: &str) -> Result<Option<Value>> {
         use crate::storage::sstable::SstableLookupResult;
 
@@ -1504,8 +1600,8 @@ impl LsmTreeEngine {
                     continue;
                 };
                 if level == 0 {
+                    // Probe all L0 candidates; winner is chosen by timestamp below.
                     (0..level_sstables.len())
-                        .rev()
                         .filter(|&idx| level_sstables[idx].key_may_exist(key))
                         .collect()
                 } else {
@@ -1515,6 +1611,11 @@ impl LsmTreeEngine {
                         .collect()
                 }
             };
+
+            // L0: highest timestamp across overlapping files.
+            // L1+: non-overlapping ranges; first non-missing is definitive.
+            let mut best_ts: u64 = 0;
+            let mut best: Option<SstableLookupResult> = None;
 
             for idx in candidate_indices {
                 let Some(_read_pin) = self.pin_sstable_reader(level, idx).await else {
@@ -1532,10 +1633,38 @@ impl LsmTreeEngine {
                 #[cfg(feature = "metrics")]
                 record_sstable_read(&self.metrics);
                 match sstable.lookup_pinned(key, Some(&self.block_cache)).await {
-                    Ok(SstableLookupResult::Found(value)) => return Ok(Some(value)),
-                    Ok(SstableLookupResult::Tombstone) => return Ok(None),
                     Ok(SstableLookupResult::Missing) => {}
+                    Ok(hit) => {
+                        let ts = match &hit {
+                            SstableLookupResult::Found { timestamp, .. } => *timestamp,
+                            SstableLookupResult::Tombstone { timestamp } => *timestamp,
+                            SstableLookupResult::Missing => 0,
+                        };
+                        if level == 0 {
+                            if ts >= best_ts {
+                                best_ts = ts;
+                                best = Some(hit);
+                            }
+                        } else {
+                            // Non-overlapping levels: first hit is enough.
+                            return Ok(match hit {
+                                SstableLookupResult::Found { value, .. } => Some(value),
+                                SstableLookupResult::Tombstone { .. } => None,
+                                SstableLookupResult::Missing => None,
+                            });
+                        }
+                    }
                     Err(e) => debug!("Error reading from SSTable L{level}[{idx}]: {e}"),
+                }
+            }
+
+            if level == 0 {
+                if let Some(hit) = best {
+                    return Ok(match hit {
+                        SstableLookupResult::Found { value, .. } => Some(value),
+                        SstableLookupResult::Tombstone { .. } => None,
+                        SstableLookupResult::Missing => None,
+                    });
                 }
             }
         }
@@ -5211,6 +5340,125 @@ mod tests {
             parse_sstable_flush_sequence_from_filename("not_an_sst.txt"),
             None
         );
+    }
+
+    /// Compaction dedup picks the highest entry timestamp. After restart the
+    /// sequence counter must sit *above* every timestamp already on disk;
+    /// otherwise a post-restart overwrite/delete can lose to a pre-restart
+    /// value and resurrect dead data.
+    #[tokio::test]
+    async fn test_restart_overwrite_delete_no_resurrection_after_compaction() {
+        use crate::Value;
+
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            // Keep L0 files so we can force a deterministic compact after restart.
+            compaction: CompactionConfig {
+                background_enabled: false,
+                ..Default::default()
+            },
+            // Small memtable so flushes are easy to trigger deliberately.
+            memtable: MemtableConfig {
+                max_size: 64 * 1024,
+                ..Default::default()
+            },
+            levels: LevelConfig {
+                // Force L0 compaction once we have a few files.
+                max_sstables_per_level: 2,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        };
+
+        // Phase 1: write and flush an "old" value (high entry timestamps).
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("create engine");
+            // Pad with extra keys so the flush burns many sequence numbers.
+            for i in 0..40 {
+                engine
+                    .put(
+                        &format!("pad:{i}"),
+                        &Value::Bytes(format!("p{i}").into_bytes()),
+                    )
+                    .await
+                    .expect("pad put");
+            }
+            engine
+                .put("victim", &Value::Bytes(b"old-value".to_vec()))
+                .await
+                .expect("put old");
+            engine.flush().await.expect("flush old");
+            engine.shutdown().await.expect("shutdown 1");
+        }
+
+        // Phase 2: reopen (sequence must resume above entry timestamps), overwrite
+        // then delete, flush, compact — old value must not reappear.
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("reopen");
+            // SEQUENCE / entry-ts watermark must exceed the pre-restart max.
+            let seq = engine.sequence_number.load(Ordering::SeqCst);
+            assert!(
+                seq > 40,
+                "sequence_number {seq} should be well above pre-restart entry timestamps"
+            );
+
+            engine
+                .put("victim", &Value::Bytes(b"new-value".to_vec()))
+                .await
+                .expect("put new");
+            engine.flush().await.expect("flush new");
+
+            engine.delete("victim").await.expect("delete");
+            engine.flush().await.expect("flush tombstone");
+
+            // Force merge of overlapping L0 files (includes old live + tombstone).
+            engine.compact_all().await.expect("compact_all");
+
+            let got = engine.get("victim").await.expect("get");
+            assert_eq!(
+                got, None,
+                "tombstone must win after restart+compaction; got {:?}",
+                got
+            );
+
+            // Overwrite after delete must stick too.
+            engine
+                .put("victim", &Value::Bytes(b"after-delete".to_vec()))
+                .await
+                .expect("put after delete");
+            engine.flush().await.expect("flush after delete");
+            engine.compact_all().await.expect("compact again");
+            let got = engine.get("victim").await.expect("get 2");
+            assert_eq!(
+                got,
+                Some(Value::Bytes(b"after-delete".to_vec())),
+                "post-delete overwrite must not lose to pre-restart old-value"
+            );
+            engine.shutdown().await.expect("shutdown 2");
+        }
+
+        // Phase 3: cold restart — still no resurrection.
+        {
+            let engine = LsmTreeEngine::new(config).await.expect("cold reopen");
+            let got = engine.get("victim").await.expect("get cold");
+            assert_eq!(
+                got,
+                Some(Value::Bytes(b"after-delete".to_vec())),
+                "cold restart must preserve post-delete overwrite"
+            );
+        }
     }
 
     /// Regression: after restart the flush sequence must continue past on-disk
