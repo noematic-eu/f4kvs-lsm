@@ -488,10 +488,21 @@ impl CompactionManager {
                 .map_err(|_| LsmError::Internal("Compaction semaphore closed".to_string()))?;
 
             let entries = self.read_sstable_entries_safe(sstable).await;
+            // Distinguish truly empty SSTables (entry_count == 0) from read
+            // failures. Treating a failed read as "empty" then deleting the
+            // input drops live keys permanently (soak crash-gate, 2026-08-11).
+            let expected = sstable.metadata().entry_count;
             if entries.is_empty() {
+                if expected == 0 {
+                    // Legitimately empty — skip.
+                    continue;
+                }
                 warn!(
-                    "SSTable {:?} returned no entries (possibly corrupted or empty)",
-                    sstable.path()
+                    "SSTable {:?} returned 0 entries but metadata.entry_count={} \
+                     (read failure / not-ready / truncated) — aborting compaction \
+                     rather than dropping its keys",
+                    sstable.path(),
+                    expected
                 );
                 corrupted_sstables.push(sstable.path().to_path_buf());
             } else {
@@ -500,11 +511,11 @@ impl CompactionManager {
         }
 
         if !corrupted_sstables.is_empty() {
-            warn!(
-                "Compaction encountered {} corrupted SSTables: {:?}",
+            return Err(LsmError::Internal(format!(
+                "Compaction aborted: {} SSTable(s) unreadable (would drop keys if inputs were deleted): {:?}",
                 corrupted_sstables.len(),
                 corrupted_sstables
-            );
+            )));
         }
 
         // Sort by key, then by timestamp (newest first)
