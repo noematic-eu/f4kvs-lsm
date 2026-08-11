@@ -28,6 +28,9 @@ pub struct StorageStats {
     /// WAL statistics
     pub wal_stats: Option<WALStats>,
 
+    /// Buffer-pool write-back durability statistics (when write-back is enabled)
+    pub write_back_stats: Option<WriteBackStats>,
+
     /// Health indicators
     pub health: HealthStats,
 
@@ -46,6 +49,7 @@ impl Default for StorageStats {
             cf_stats: HashMap::new(),
             memory_stats: MemoryStats::default(),
             wal_stats: None,
+            write_back_stats: None,
             health: HealthStats::default(),
             timestamp: SystemTime::now(),
         }
@@ -367,6 +371,132 @@ impl MemoryStats {
                 0.0
             };
         }
+    }
+}
+
+/// Buffer-pool write-back durability statistics.
+///
+/// Tracks the instantaneous loss window for acknowledged writes that have not
+/// yet been persisted (WAL-synced) by the write-back worker. When write-back
+/// is disabled these fields stay at zero / `None` on `StorageStats`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteBackStats {
+    /// Whether write-back is currently enabled on the buffer pool
+    pub enabled: bool,
+    /// Bounded write-queue capacity (ops)
+    pub queue_capacity: u64,
+    /// Current write-queue depth (ops waiting for the worker)
+    pub queue_depth: u64,
+    /// Ops currently held in the worker's in-flight batch (not yet flushed)
+    pub batch_inflight: u64,
+    /// Client-acknowledged write ops (put returned after enqueue / force-durable barrier)
+    pub ops_acked: u64,
+    /// Ops successfully persisted to the backend (batch_put completed; WAL synced)
+    pub ops_durable: u64,
+    /// Number of write batches successfully flushed to the backend
+    pub batches_persisted: u64,
+    /// Number of WAL syncs performed by the write-back path (one per successful batch)
+    pub wal_syncs: u64,
+    /// Instantaneous acked-minus-durable gap (ops at risk of loss on kill -9)
+    pub acked_durable_gap: u64,
+}
+
+impl Default for WriteBackStats {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            queue_capacity: 0,
+            queue_depth: 0,
+            batch_inflight: 0,
+            ops_acked: 0,
+            ops_durable: 0,
+            batches_persisted: 0,
+            wal_syncs: 0,
+            acked_durable_gap: 0,
+        }
+    }
+}
+
+impl WriteBackStats {
+    /// Format as Prometheus exposition lines (no trailing blank line required).
+    pub fn to_prometheus(&self) -> String {
+        let mut out = String::with_capacity(1024);
+        let enabled = if self.enabled { 1 } else { 0 };
+        out.push_str(
+            "# HELP f4kvs_write_back_enabled Whether buffer-pool write-back is enabled\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_enabled gauge\n");
+        out.push_str(&format!("f4kvs_write_back_enabled {}\n", enabled));
+
+        out.push_str(
+            "# HELP f4kvs_write_back_queue_capacity Bounded write-back queue capacity in ops\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_queue_capacity gauge\n");
+        out.push_str(&format!(
+            "f4kvs_write_back_queue_capacity {}\n",
+            self.queue_capacity
+        ));
+
+        out.push_str(
+            "# HELP f4kvs_write_back_queue_depth Current write-back queue depth in ops\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_queue_depth gauge\n");
+        out.push_str(&format!("f4kvs_write_back_queue_depth {}\n", self.queue_depth));
+
+        out.push_str(
+            "# HELP f4kvs_write_back_batch_inflight Ops in the worker in-flight batch\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_batch_inflight gauge\n");
+        out.push_str(&format!(
+            "f4kvs_write_back_batch_inflight {}\n",
+            self.batch_inflight
+        ));
+
+        out.push_str(
+            "# HELP f4kvs_write_back_ops_acked_total Client-acked write ops through the buffer pool\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_ops_acked_total counter\n");
+        out.push_str(&format!(
+            "f4kvs_write_back_ops_acked_total {}\n",
+            self.ops_acked
+        ));
+
+        out.push_str(
+            "# HELP f4kvs_write_back_ops_durable_total Ops persisted (WAL-synced) by the write-back worker\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_ops_durable_total counter\n");
+        out.push_str(&format!(
+            "f4kvs_write_back_ops_durable_total {}\n",
+            self.ops_durable
+        ));
+
+        out.push_str(
+            "# HELP f4kvs_write_back_batches_persisted_total Successful write-back batch flushes\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_batches_persisted_total counter\n");
+        out.push_str(&format!(
+            "f4kvs_write_back_batches_persisted_total {}\n",
+            self.batches_persisted
+        ));
+
+        out.push_str(
+            "# HELP f4kvs_write_back_wal_syncs_total WAL syncs performed by the write-back path\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_wal_syncs_total counter\n");
+        out.push_str(&format!(
+            "f4kvs_write_back_wal_syncs_total {}\n",
+            self.wal_syncs
+        ));
+
+        out.push_str(
+            "# HELP f4kvs_write_back_acked_durable_gap Instantaneous acked-minus-durable loss window in ops\n",
+        );
+        out.push_str("# TYPE f4kvs_write_back_acked_durable_gap gauge\n");
+        out.push_str(&format!(
+            "f4kvs_write_back_acked_durable_gap {}\n",
+            self.acked_durable_gap
+        ));
+        out
     }
 }
 

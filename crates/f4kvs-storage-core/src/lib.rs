@@ -58,6 +58,7 @@ pub use monitoring::{
 pub use stats::{
     BloomFilterStats, CacheMetrics, CacheStats, ColumnFamilyStats, CompactionStats, HealthStats,
     HealthStatus, IoMetrics, IoStats, LevelStats, MemoryStats, StorageStats, WALStats,
+    WriteBackStats,
 };
 pub use traits::{
     Compactable, CompactionConfig as TraitCompactionConfig,

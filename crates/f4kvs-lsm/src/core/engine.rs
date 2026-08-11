@@ -2206,6 +2206,7 @@ impl StorageEngine for LsmTreeEngine {
                 ..Default::default()
             },
             wal_stats: None,
+            write_back_stats: None,
             health: f4kvs_storage_core::stats::HealthStats::default(),
             timestamp: SystemTime::now(),
         })
