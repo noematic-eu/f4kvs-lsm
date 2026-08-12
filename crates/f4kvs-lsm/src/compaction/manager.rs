@@ -252,6 +252,10 @@ impl CompactionManager {
         // Clone SSTables we need for compaction BEFORE releasing the lock
         // This allows us to release the lock during the actual compaction work
         let all_sstables = sstables_guard.clone();
+        let input_paths: std::collections::HashSet<_> = all_sstables
+            .get(&level)
+            .map(|v| v.iter().map(|s| s.path().clone()).collect())
+            .unwrap_or_default();
 
         // Release the lock BEFORE doing the expensive compaction work
         // This allows reads to proceed while compaction is happening
@@ -295,8 +299,21 @@ impl CompactionManager {
             }
         };
 
-        // Update the level with new SSTables
-        sstables_guard.insert(level, new_sstables);
+        // Preserve SSTables that appeared during compaction I/O (concurrent
+        // flushes) — same invariant as compact_all. Replacing the level with
+        // only the pre-I/O snapshot + outputs would drop live tombstones from
+        // the in-memory index until restart.
+        let concurrent: Vec<SSTable> = sstables_guard
+            .get(&level)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !input_paths.contains(s.path()) && !s.is_marked_for_deletion())
+            .collect();
+
+        let mut merged = new_sstables;
+        merged.extend(concurrent);
+        sstables_guard.insert(level, merged);
 
         // Lock is released here, allowing reads to proceed immediately
 
@@ -395,13 +412,27 @@ impl CompactionManager {
                 let compacted_sstables =
                     self.compact_level_sstables(level, &valid_sstables).await?;
 
-                // Update the level with compacted SSTables
-                // Mark old SSTables for deletion (they will be cleaned up later)
+                // Mark compacted inputs for deletion (memory flag; files GC later).
                 for sstable in &valid_sstables {
                     sstable.mark_for_deletion();
                 }
 
-                sstables_guard.insert(level, compacted_sstables);
+                // Preserve SSTables that appeared during compaction I/O (concurrent
+                // flushes) — they were not in valid_sstables and must not be dropped
+                // from the in-memory index (would hide live tombstones until restart).
+                let input_paths: std::collections::HashSet<_> =
+                    valid_sstables.iter().map(|s| s.path().clone()).collect();
+                let concurrent: Vec<SSTable> = sstables_guard
+                    .get(&level)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| !input_paths.contains(s.path()) && !s.is_marked_for_deletion())
+                    .collect();
+
+                let mut merged = compacted_sstables;
+                merged.extend(concurrent);
+                sstables_guard.insert(level, merged);
                 // Lock released here, allowing other operations to proceed
             }
         }
@@ -1185,9 +1216,16 @@ impl CompactionManager {
             message: format!("Failed to create data directory: {}", e),
         })?;
 
+        // Unique name: second-granularity alone collides when two compactions
+        // finish in the same second (or multi-output of one compaction), and
+        // the second write clobbers the first file while the in-memory handle
+        // still points at the old index — can resurrect deleted keys.
         let timestamp = utils::timestamp_secs();
-
-        let filename = format!("sstable_l{}_t{}.sst", level, timestamp);
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let filename = format!("sstable_l{}_t{}_{:x}.sst", level, timestamp, uniq);
         let path = self.data_dir.join(filename);
 
         let mut sstable = SSTable::new(path, self.sstable_config.clone(), level)?;

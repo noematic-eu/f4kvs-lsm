@@ -3186,6 +3186,12 @@ impl StorageEngine for LsmTreeEngine {
     async fn flush(&self) -> std::result::Result<(), F4KvsError> {
         tracing::info!("LSM Engine: Starting flush operation");
 
+        // Exclusive write lock: no concurrent put/delete may land in the active
+        // memtable + WAL while we flush and truncate. Otherwise a delete that
+        // arrives after the memtable swap is wiped by truncate_after_flush and
+        // only exists in-memory — SIGKILL then resurrects the key from older SSTs.
+        let _op_guard = self.operation_guard.write().await;
+
         // Flush WAL first to ensure durability
         if self.config.wal.enabled {
             tracing::info!("LSM Engine: Flushing WAL");
@@ -3193,11 +3199,15 @@ impl StorageEngine for LsmTreeEngine {
             wal.flush().await.map_err(Self::convert_error)?;
         }
 
-        // Then flush memtable to SSTable
+        // Flush active memtable (no nested op_guard — we already hold write).
         tracing::info!("LSM Engine: Flushing memtable");
-        self.flush_memtable().await.map_err(Self::convert_error)?;
+        self.flush_memtable_internal()
+            .await
+            .map_err(Self::convert_error)?;
 
-        // After successful memtable flush, truncate WAL to prevent recovery
+        // After successful memtable flush, truncate WAL to prevent recovery of
+        // data already in SSTables. Safe under exclusive op_guard: no concurrent
+        // tombstones/puts can be only-in-WAL.
         if self.config.wal.enabled {
             tracing::info!("LSM Engine: Truncating WAL after flush");
             let wal = self.wal_manager.read().await;
@@ -5983,52 +5993,6 @@ mod tests {
         }
     }
 
-    /// FORENSIC (temporaire, à retirer): inspecte l'état on-disk réel du run
-    /// soak-20260812T131837Z pour la clé ressuscitée soak:cdel:49.
-    #[tokio::test]
-    async fn forensic_inspect_cdel49() {
-        let dir = std::path::PathBuf::from("/tmp/f4kvs-forensics-copy");
-        let files = [
-            "L0_0000000000000461.sst",
-            "L0_0000000000001b22.sst",
-            "L0_00000000000021bc.sst",
-            "L0_00000000000024e6.sst",
-            "L0_0000000000002d28.sst",
-            "L0_000000000000400d.sst",
-            "L0_0000000000004ced.sst",
-            "L0_00000000000053bf.sst",
-            "L0_00000000000061bc.sst",
-            "L0_0000000000006bca.sst",
-            "sstable_l0_t1786540989.sst",
-        ];
-        for name in files {
-            let path = dir.join(name);
-            let mut t = SSTable::new(path, SstableConfig::default(), 0).expect("new");
-            if let Err(e) = t.open().await {
-                println!("{name} OPEN ERR {e}");
-                continue;
-            }
-            println!(
-                "{name} ready={} range=[{:?}..{:?}] may_exist={}",
-                t.is_ready(),
-                t.metadata().smallest_key,
-                t.metadata().largest_key,
-                t.key_may_exist("soak:cdel:49")
-            );
-            match t.get_all_entries().await {
-                Ok(entries) => {
-                    for e in entries.iter().filter(|e| e.key == "soak:cdel:49") {
-                        println!(
-                            "  {name} => ts={} deleted={} value={:?}",
-                            e.timestamp, e.deleted, e.value
-                        );
-                    }
-                }
-                Err(e) => println!("  {name} READ ERR {e}"),
-            }
-        }
-    }
-
     /// A: put -> flush (seed in SSTable) -> delete (tombstone ONLY in WAL)
     /// -> simulated SIGKILL (mem::forget) -> reopen -> key must be gone.
     #[tokio::test]
@@ -6093,6 +6057,105 @@ mod tests {
         assert_eq!(
             got, None,
             "flushed tombstone must win over older seed SSTable; got {got:?}"
+        );
+    }
+
+    /// C: force_durable-style pattern — full StorageEngine::flush (memtable + WAL
+    /// truncate) interleaved with deletes, then SIGKILL. Exclusive op_guard on
+    /// flush prevents truncate from dropping a tombstone that only lived in WAL.
+    #[tokio::test]
+    async fn test_delete_survives_repeated_full_flush_then_sigkill() {
+        use crate::Value;
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = tombstone_repro_config(data_dir);
+
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("create");
+            engine
+                .put("cdel:49", &Value::Bytes(b"seed-49".to_vec()))
+                .await
+                .expect("put seed");
+            // Full flush: seed to SST, WAL truncated (force_durable pattern).
+            engine.flush().await.expect("flush seed");
+
+            for round in 0..5u32 {
+                engine.delete("cdel:49").await.expect("acked delete");
+                // More traffic + full flush (mirrors force_durable barrier).
+                engine
+                    .put(
+                        &format!("other:{round}"),
+                        &Value::Bytes(b"x".to_vec()),
+                    )
+                    .await
+                    .expect("put other");
+                engine.flush().await.expect("full flush");
+            }
+            // Final delete only in WAL+memtable (no trailing flush).
+            engine.delete("cdel:49").await.expect("final delete");
+            std::mem::forget(engine);
+        }
+
+        let engine = LsmTreeEngine::new(config).await.expect("reopen");
+        let got = engine.get("cdel:49").await.expect("get");
+        assert_eq!(
+            got, None,
+            "delete must survive full-flush interleaving + SIGKILL; got {got:?}"
+        );
+    }
+
+    /// D: many L0 files + compaction + delete — tombstone must win after restart.
+    #[tokio::test]
+    async fn test_delete_with_many_l0_and_compaction_survives_sigkill() {
+        use crate::Value;
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let mut config = tombstone_repro_config(data_dir);
+        config.compaction.background_enabled = true;
+        config.levels.max_sstables_per_level = 4; // force L0 compaction sooner
+        config.memtable.max_size = 512;
+
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("create");
+            engine
+                .put("soak:cdel:49", &Value::Bytes(b"cdel-seed-49".to_vec()))
+                .await
+                .expect("seed");
+            engine.flush().await.expect("flush seed");
+
+            for i in 0..30u32 {
+                engine
+                    .put(&format!("k{i}"), &Value::Bytes(b"v".to_vec()))
+                    .await
+                    .expect("put");
+                if i % 3 == 0 {
+                    engine.flush().await.expect("flush");
+                }
+            }
+            engine
+                .delete("soak:cdel:49")
+                .await
+                .expect("delete");
+            // Force tombstone into an L0 file.
+            engine
+                .put("trailer", &Value::Bytes(b"t".to_vec()))
+                .await
+                .expect("trailer");
+            engine.flush().await.expect("flush tombstone");
+            // Trigger compact_all path used by some call sites.
+            let _ = engine.compact_all().await;
+            std::mem::forget(engine);
+        }
+
+        let engine = LsmTreeEngine::new(config).await.expect("reopen");
+        let got = engine.get("soak:cdel:49").await.expect("get");
+        assert_eq!(
+            got, None,
+            "tombstone must win after many L0 + compaction + restart; got {got:?}"
         );
     }
 }
