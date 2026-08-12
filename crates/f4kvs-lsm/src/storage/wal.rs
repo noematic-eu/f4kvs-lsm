@@ -96,13 +96,20 @@ impl WALSegment {
             sync_mode,
         };
 
-        // Write header
+        // Write header and durable it — otherwise SIGKILL can leave a 0-byte
+        // segment that previously blocked all recovery (early eof).
         segment.write_header().await?;
+        segment.file.sync_data().await.map_err(LsmError::Io)?;
 
         Ok(segment)
     }
 
-    /// Open an existing WAL segment for reading
+    /// Open an existing WAL segment for reading.
+    ///
+    /// Empty or header-incomplete files (SIGKILL mid-`WALSegment::new` / mid-truncate
+    /// rotate) are treated as valid **empty** segments: post-flush truncate creates a
+    /// fresh file, and a crash before the first durable put must not block recovery
+    /// when SSTables already hold the data (crash-loop 2026-08-12).
     pub async fn open_for_reading(
         path: PathBuf,
         max_size: u64,
@@ -114,6 +121,8 @@ impl WALSegment {
             .await
             .map_err(LsmError::Io)?;
 
+        let file_len = file.metadata().await.map_err(LsmError::Io)?.len();
+
         // Read header directly (it's written without size prefix)
         let header_size = bincode::serialized_size(&WALSegmentHeader {
             magic: Self::MAGIC,
@@ -123,6 +132,27 @@ impl WALSegment {
         })
         .map_err(|e| LsmError::Serialization(format!("Failed to get header size: {}", e)))?
             as usize;
+
+        if file_len == 0 || file_len < header_size as u64 {
+            warn!(
+                "WAL segment {:?} is empty/incomplete ({} bytes < header {}); treating as empty",
+                path, file_len, header_size
+            );
+            let header = WALSegmentHeader {
+                magic: Self::MAGIC,
+                version: Self::VERSION,
+                created_at: 0,
+                entry_count: 0,
+            };
+            return Ok(Self {
+                path,
+                file,
+                header,
+                entry_count: 0,
+                max_size,
+                sync_mode,
+            });
+        }
 
         let mut header_buffer = vec![0u8; header_size];
         file.read_exact(&mut header_buffer)
@@ -285,35 +315,71 @@ impl WALSegment {
     pub async fn read_entries(&mut self) -> Result<Vec<WALEntry>> {
         let mut entries = Vec::new();
 
+        // Empty/incomplete file opened as zero-entry segment (see open_for_reading).
+        let file_len = self.file.metadata().await.map_err(LsmError::Io)?.len();
+        if file_len == 0 || self.header.entry_count == 0 && file_len < 32 {
+            // Header may still be present with entry_count=0 — fall through to scan.
+            if file_len == 0 {
+                return Ok(entries);
+            }
+        }
+
         // Seek to after header
         let header_size = bincode::serialized_size(&self.header)
             .map_err(|e| LsmError::Serialization(format!("Failed to get header size: {}", e)))?
             as u64;
+
+        if file_len <= header_size {
+            return Ok(entries);
+        }
 
         self.file
             .seek(tokio::io::SeekFrom::Start(header_size))
             .await
             .map_err(LsmError::Io)?;
 
-        // Read entries
-        while let Ok(size) = self.file.read_u32_le().await {
+        // Read entries; a torn last record (SIGKILL mid-write) stops cleanly —
+        // prior complete entries remain recoverable.
+        loop {
+            let size = match self.file.read_u32_le().await {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(LsmError::Io(e)),
+            };
             if size == 0 {
                 break; // End of entries
             }
+            // Sanity: absurd sizes mean corruption / torn length prefix.
+            if size as u64 > self.max_size {
+                warn!(
+                    "WAL entry size {} exceeds segment max {}; stopping read ({} entries recovered)",
+                    size,
+                    self.max_size,
+                    entries.len()
+                );
+                break;
+            }
 
-            // Read entry data
             let mut entry_buffer = vec![0u8; size as usize];
-            self.file
-                .read_exact(&mut entry_buffer)
-                .await
-                .map_err(LsmError::Io)?;
+            match self.file.read_exact(&mut entry_buffer).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    warn!(
+                        "Torn WAL entry at end of {:?} (need {} bytes); recovered {} complete entries",
+                        self.path,
+                        size,
+                        entries.len()
+                    );
+                    break;
+                }
+                Err(e) => return Err(LsmError::Io(e)),
+            }
 
-            // Deserialize entry with better error handling
             let entry: WALEntry = match bincode::deserialize(&entry_buffer) {
                 Ok(entry) => entry,
                 Err(e) => {
                     warn!("Failed to deserialize WAL entry: {}, skipping entry", e);
-                    continue; // Skip this corrupted entry
+                    continue;
                 }
             };
 
@@ -641,232 +707,188 @@ impl WALManager {
         Ok(())
     }
 
-    /// Truncate WAL after successful flush to LSM-Tree
-    /// This clears all WAL entries that have been successfully flushed to SSTables
+    /// List `segment_*.wal` paths on disk (any process lifetime — includes phantoms
+    /// never tracked in `self.segments` after a prior session crash/restart).
+    fn list_segment_files_on_disk(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        if !self.wal_dir.exists() {
+            return paths;
+        }
+        if let Ok(entries) = std::fs::read_dir(&self.wal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("segment_") && name.ends_with(".wal") {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    /// Parse hex segment id from `segment_{:016x}.wal`.
+    fn parse_segment_id(file_name: &str) -> Option<u64> {
+        file_name
+            .strip_prefix("segment_")
+            .and_then(|s| s.strip_suffix(".wal"))
+            .and_then(|id| u64::from_str_radix(id, 16).ok())
+    }
+
+    async fn remove_file_with_retries(path: &std::path::Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut retry_count = 0;
+        let max_retries = 3;
+        loop {
+            match tokio::fs::remove_file(path).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        return Err(LsmError::Io(e));
+                    }
+                    tracing::warn!(
+                        "WAL: Failed to remove {:?} (attempt {}): {}, retrying...",
+                        path,
+                        retry_count,
+                        e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// Truncate WAL after successful flush to LSM-Tree.
+    ///
+    /// Removes **all** `segment_*.wal` files on disk — not only the current
+    /// in-memory handle / `self.segments` map. Residual segments from prior
+    /// process sessions (never re-registered into `segments` on open) must be
+    /// wiped here; leaving them causes recovery to re-apply stale puts into the
+    /// memtable, which then re-flush with higher sequence numbers and permanently
+    /// win L0 timestamp merges (crash-loop stale-value bug, 2026-08-12).
     pub async fn truncate_after_flush(&self) -> Result<()> {
-        tracing::info!("WAL: Starting truncate_after_flush");
+        tracing::info!("WAL: Starting truncate_after_flush (filesystem-wide)");
 
-        // Count WAL files before truncation
-        let wal_dir = std::path::Path::new(&self.wal_dir);
-        let initial_file_count = if wal_dir.exists() {
-            std::fs::read_dir(wal_dir)
-                .map(|entries| entries.count())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        tracing::info!("WAL: Found {} files before truncation", initial_file_count);
+        let initial_file_count = self.list_segment_files_on_disk().len();
+        tracing::info!(
+            "WAL: Found {} segment file(s) before truncation",
+            initial_file_count
+        );
 
-        // Close and remove current segment
-        let mut current_segment = self.current_segment.write().await;
-        if let Some(mut segment) = current_segment.take() {
-            let path = segment.path().to_path_buf();
-            tracing::info!("WAL: Closing current segment: {:?}", path);
-
-            // Close the segment first and ensure file handle is released
-            if let Err(e) = segment.close().await {
-                tracing::warn!("WAL: Error closing segment {:?}: {}", path, e);
+        // Drop the live handle first so the OS releases the file.
+        {
+            let mut current_segment = self.current_segment.write().await;
+            if let Some(mut segment) = current_segment.take() {
+                let path = segment.path().to_path_buf();
+                if let Err(e) = segment.close().await {
+                    tracing::warn!("WAL: Error closing current segment {:?}: {}", path, e);
+                }
+                drop(segment);
             }
-            drop(segment); // Explicitly drop to release file handle
+        }
+        // Forget in-memory completed-segment bookkeeping; disk scan is authoritative.
+        {
+            let mut segments = self.segments.write().await;
+            segments.clear();
+        }
 
-            // Small delay to ensure file handle is released
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-            // Verify file exists before removal
+        // Wipe every residual segment file on disk (prior sessions + this session).
+        let to_remove = self.list_segment_files_on_disk();
+        tracing::info!(
+            "WAL: Removing {} segment file(s) from disk after memtable flush",
+            to_remove.len()
+        );
+        for path in &to_remove {
+            Self::remove_file_with_retries(path).await?;
             if path.exists() {
-                tracing::info!("WAL: Removing current segment file: {:?}", path);
-
-                // Retry logic for file removal (handle OS file locking)
-                let mut retry_count = 0;
-                let max_retries = 3;
-                while retry_count < max_retries {
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(_) => {
-                            tracing::info!("WAL: Successfully removed current segment: {:?}", path);
-                            break;
-                        }
-                        Err(e) => {
-                            retry_count += 1;
-                            if retry_count >= max_retries {
-                                return Err(LsmError::Io(e));
-                            }
-                            tracing::warn!(
-                                "WAL: Failed to remove {:?} (attempt {}): {}, retrying...",
-                                path,
-                                retry_count,
-                                e
-                            );
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                        }
-                    }
-                }
-
-                // Verify removal
-                if path.exists() {
-                    return Err(LsmError::Io(std::io::Error::other(format!(
-                        "Failed to remove WAL file after {} retries: {:?}",
-                        max_retries, path
-                    ))));
-                }
-            } else {
-                tracing::info!("WAL: Current segment file already removed: {:?}", path);
-            }
-        } else {
-            tracing::info!("WAL: No current segment to remove");
-        }
-
-        // Clear all completed segments
-        let mut segments = self.segments.write().await;
-        tracing::info!("WAL: Removing {} completed segments", segments.len());
-
-        let mut failed_removals = Vec::new();
-        for (id, path) in segments.iter() {
-            if path.exists() {
-                tracing::info!("WAL: Removing segment {}: {:?}", id, path);
-
-                // Retry logic for segment removal
-                let mut retry_count = 0;
-                let max_retries = 3;
-                let mut removal_success = false;
-
-                while retry_count < max_retries {
-                    match tokio::fs::remove_file(path).await {
-                        Ok(_) => {
-                            tracing::info!("WAL: Successfully removed segment {}: {:?}", id, path);
-                            removal_success = true;
-                            break;
-                        }
-                        Err(e) => {
-                            retry_count += 1;
-                            if retry_count >= max_retries {
-                                tracing::error!(
-                                    "WAL: Failed to remove segment {} after {} retries: {}",
-                                    id,
-                                    max_retries,
-                                    e
-                                );
-                                failed_removals.push((*id, path.clone(), e));
-                            } else {
-                                tracing::warn!("WAL: Failed to remove segment {} (attempt {}): {}, retrying...",
-                                    id, retry_count, e);
-                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            }
-                        }
-                    }
-                }
-
-                if !removal_success && path.exists() {
-                    return Err(LsmError::Io(std::io::Error::other(format!(
-                        "Failed to remove WAL segment {}: {:?}",
-                        id, path
-                    ))));
-                }
-            } else {
-                tracing::info!("WAL: Segment {} already removed: {:?}", id, path);
-            }
-        }
-        segments.clear();
-
-        // Count remaining WAL files after truncation
-        let final_file_count = if wal_dir.exists() {
-            std::fs::read_dir(wal_dir)
-                .map(|entries| entries.count())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        if final_file_count > 0 {
-            tracing::warn!(
-                "WAL: {} files remain after truncation (started with {})",
-                final_file_count,
-                initial_file_count
-            );
-        } else {
-            tracing::info!(
-                "WAL: All files successfully removed (started with {})",
-                initial_file_count
-            );
-        }
-
-        if !failed_removals.is_empty() {
-            tracing::error!("WAL: Failed to remove {} segments", failed_removals.len());
-            for (id, path, error) in failed_removals {
-                tracing::error!("WAL: Failed segment {}: {:?} - {}", id, path, error);
+                return Err(LsmError::Io(std::io::Error::other(format!(
+                    "Failed to remove WAL segment after retries: {:?}",
+                    path
+                ))));
             }
         }
 
-        // CRITICAL FIX: Create a new fresh segment after truncation
-        // This ensures continuous operation by immediately providing a fresh WAL segment for subsequent writes
-        drop(current_segment); // Release write lock
+        let remaining = self.list_segment_files_on_disk().len();
+        if remaining > 0 {
+            return Err(LsmError::Io(std::io::Error::other(format!(
+                "WAL truncation incomplete: {} segment file(s) still on disk after wipe",
+                remaining
+            ))));
+        }
+        tracing::info!(
+            "WAL: All segment files removed (started with {})",
+            initial_file_count
+        );
+
+        // Fresh empty segment for subsequent writes.
         self.rotate_segment().await?;
         tracing::info!("WAL: Created new segment after truncation");
-
         tracing::info!("WAL: truncate_after_flush completed successfully");
         Ok(())
     }
 
-    /// Verify that all WAL files have been removed
+    /// Verify truncation: in-memory map empty, and at most one live segment file
+    /// (the fresh post-truncate current segment).
     pub async fn verify_truncated(&self) -> Result<bool> {
         let current_segment = self.current_segment.read().await;
-        // After truncation, we should have a fresh new segment (not None)
         if current_segment.is_none() {
-            tracing::warn!("WAL: No current segment exists during verification - this indicates truncation failed");
+            tracing::warn!(
+                "WAL: No current segment exists during verification - truncation failed"
+            );
             return Ok(false);
         }
+        let current_path = current_segment.as_ref().map(|s| s.path().to_path_buf());
 
         let segments = self.segments.read().await;
         if !segments.is_empty() {
             tracing::warn!(
-                "WAL: {} segments still exist during verification",
+                "WAL: {} completed segments still tracked during verification",
                 segments.len()
             );
             return Ok(false);
         }
 
-        // Additional verification: check filesystem for any remaining WAL files
-        let wal_dir = std::path::Path::new(&self.wal_dir);
-        if wal_dir.exists() {
-            let remaining_files = std::fs::read_dir(wal_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|entry| entry.ok())
-                        .filter(|entry| {
-                            entry
-                                .path()
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .map(|ext| ext == "log")
-                                .unwrap_or(false)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-
-            if remaining_files > 0 {
+        let on_disk = self.list_segment_files_on_disk();
+        // Exactly one segment file expected: the fresh current after rotate.
+        if on_disk.len() > 1 {
+            tracing::warn!(
+                "WAL: {} segment files on disk during verification (expected 1): {:?}",
+                on_disk.len(),
+                on_disk
+            );
+            return Ok(false);
+        }
+        if let (Some(cur), Some(disk)) = (current_path.as_ref(), on_disk.first()) {
+            if cur != disk {
                 tracing::warn!(
-                    "WAL: {} files still exist in filesystem during verification",
-                    remaining_files
+                    "WAL: current segment path {:?} != sole disk segment {:?}",
+                    cur,
+                    disk
                 );
                 return Ok(false);
             }
         }
 
-        tracing::info!("WAL: Verification successful - all WAL files removed");
+        tracing::info!("WAL: Verification successful - only fresh current segment remains");
         Ok(true)
     }
 
     /// Read all entries from WAL files on disk (startup recovery).
+    /// Segments are read in ascending segment-id order; within equal timestamps
+    /// a stable sort preserves that order (second-granularity timestamps alone
+    /// are not a total order across residual multi-session segments).
     pub async fn read_entries_from_disk(&self) -> Result<Vec<WALEntry>> {
         let mut all_entries = Vec::new();
         if !self.wal_dir.exists() {
             return Ok(all_entries);
         }
 
-        let mut segment_files_found = 0usize;
-        let mut segments_read_ok = 0usize;
-        let mut read_errors = Vec::new();
-
+        let mut segment_files: Vec<(u64, std::path::PathBuf)> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.wal_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -876,26 +898,40 @@ impl WALManager {
                 if !file_name.ends_with(".wal") || !file_name.starts_with("segment_") {
                     continue;
                 }
-                segment_files_found += 1;
-                match WALSegment::open_for_reading(
-                    path.clone(),
-                    self.config.segment_size as u64,
-                    self.config.sync_mode,
-                )
-                .await
-                {
-                    Ok(mut segment) => match segment.read_entries().await {
-                        Ok(entries) => {
-                            segments_read_ok += 1;
-                            all_entries.extend(entries);
-                        }
-                        Err(e) => {
-                            read_errors.push(format!("{file_name}: {e}"));
-                        }
-                    },
+                let id = Self::parse_segment_id(file_name).unwrap_or(u64::MAX);
+                segment_files.push((id, path));
+            }
+        }
+        segment_files.sort_by_key(|(id, _)| *id);
+
+        let segment_files_found = segment_files.len();
+        let mut segments_read_ok = 0usize;
+        let mut read_errors = Vec::new();
+
+        for (_id, path) in segment_files {
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string();
+            match WALSegment::open_for_reading(
+                path,
+                self.config.segment_size as u64,
+                self.config.sync_mode,
+            )
+            .await
+            {
+                Ok(mut segment) => match segment.read_entries().await {
+                    Ok(entries) => {
+                        segments_read_ok += 1;
+                        all_entries.extend(entries);
+                    }
                     Err(e) => {
                         read_errors.push(format!("{file_name}: {e}"));
                     }
+                },
+                Err(e) => {
+                    read_errors.push(format!("{file_name}: {e}"));
                 }
             }
         }
@@ -916,6 +952,7 @@ impl WALManager {
             );
         }
 
+        // Stable sort: equal timestamps keep segment-id then in-file order.
         all_entries.sort_by_key(|e| match e {
             WALEntry::Put { timestamp, .. }
             | WALEntry::Delete { timestamp, .. }

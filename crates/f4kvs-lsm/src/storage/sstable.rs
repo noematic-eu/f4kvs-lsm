@@ -690,11 +690,15 @@ impl SSTable {
         self.last_access.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Ensure file is open, re-opening if necessary
+    /// Ensure file is open, re-opening if necessary.
+    ///
+    /// After recovery load we deliberately close handles (index/metadata stay in
+    /// memory) so opening N >> ulimit SSTables succeeds. Re-open on read is the
+    /// normal path — log at debug, not warn (was drowning logs at ~300k/run).
     pub async fn ensure_file_open(&self) -> Result<()> {
         if !self.reader.is_open() {
             if self.config.enable_resilient_handling {
-                warn!("Re-opening closed SSTable file: {:?}", self.path);
+                tracing::debug!("Re-opening closed SSTable file: {:?}", self.path);
                 self.reader.ensure_open(true).await?;
                 self.update_last_access();
             } else {
@@ -1669,17 +1673,19 @@ impl SSTable {
         self.index.len()
     }
 
-    /// Close SSTable file handle
+    /// Close SSTable file handle (keeps index/metadata/`is_ready` intact).
     pub async fn close(&mut self) -> Result<()> {
-        self.reader.close().await;
+        self.close_file_handle().await;
         Ok(())
     }
 
-    /// Close file handle if open (non-mutable version for LRU eviction)
-    pub fn close_file(&self) {
-        // This is a bit of a hack - we need mutable access to close
-        // In practice, this will be called from the engine which has mutable access
-        // For now, we'll rely on the engine managing this properly
+    /// Release the OS file descriptor without invalidating in-memory index/metadata.
+    ///
+    /// Used after recovery load and LRU eviction so we can register far more
+    /// SSTables than `ulimit -n` (open-all-at-load previously capped ~8177 on
+    /// macOS soft limit 8192 and silently skipped the rest — crash-loop data loss).
+    pub async fn close_file_handle(&self) {
+        self.reader.close().await;
     }
 
     /// Get the size of the SSTable

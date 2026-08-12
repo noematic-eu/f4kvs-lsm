@@ -570,33 +570,61 @@ impl FrameWalManager {
         Ok(())
     }
 
+    fn list_frame_files_on_disk(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if !self.wal_dir.exists() {
+            return paths;
+        }
+        if let Ok(entries) = std::fs::read_dir(&self.wal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("frame_") && name.ends_with(".wal") {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    fn parse_frame_segment_id(file_name: &str) -> Option<u64> {
+        file_name
+            .strip_prefix("frame_")
+            .and_then(|s| s.strip_suffix(".wal"))
+            .and_then(|id| u64::from_str_radix(id, 16).ok())
+    }
+
     pub async fn read_entries_from_disk(&self) -> Result<Vec<WALEntry>> {
         let mut all_entries = Vec::new();
         if !self.wal_dir.exists() {
             return Ok(all_entries);
         }
-        if let Ok(entries) = std::fs::read_dir(&self.wal_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if !file_name.ends_with(".wal") || !file_name.starts_with("frame_") {
-                    continue;
-                }
-                if let Ok(mut segment) = FrameWalSegment::open_for_reading(
-                    path,
-                    self.config.segment_size as u64,
-                    self.config.sync_mode,
-                )
-                .await
-                {
-                    if let Ok(entries) = segment.read_entries().await {
-                        all_entries.extend(entries);
-                    }
+        let mut segment_files: Vec<(u64, PathBuf)> = Vec::new();
+        for path in self.list_frame_files_on_disk() {
+            let id = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(Self::parse_frame_segment_id)
+                .unwrap_or(u64::MAX);
+            segment_files.push((id, path));
+        }
+        segment_files.sort_by_key(|(id, _)| *id);
+
+        for (_id, path) in segment_files {
+            if let Ok(mut segment) = FrameWalSegment::open_for_reading(
+                path,
+                self.config.segment_size as u64,
+                self.config.sync_mode,
+            )
+            .await
+            {
+                if let Ok(entries) = segment.read_entries().await {
+                    all_entries.extend(entries);
                 }
             }
         }
+        // Stable sort: equal timestamps preserve segment-id order above.
         all_entries.sort_by_key(entry_timestamp);
         Ok(all_entries)
     }
@@ -631,25 +659,32 @@ impl FrameWalManager {
         Ok(all_entries)
     }
 
+    /// Wipe every `frame_*.wal` on disk after a successful memtable flush
+    /// (including residual phantoms from prior process sessions).
     pub async fn truncate_after_flush(&self) -> Result<()> {
-        let mut current_segment = self.current_segment.write().await;
-        if let Some(mut segment) = current_segment.take() {
-            let path = segment.path().to_path_buf();
-            segment.close().await.ok();
-            drop(segment);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        {
+            let mut current_segment = self.current_segment.write().await;
+            if let Some(mut segment) = current_segment.take() {
+                segment.close().await.ok();
+                drop(segment);
+            }
+        }
+        {
+            let mut segments = self.segments.write().await;
+            segments.clear();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        for path in self.list_frame_files_on_disk() {
             if path.exists() {
                 tokio::fs::remove_file(&path).await.map_err(LsmError::Io)?;
             }
         }
-        let mut segments = self.segments.write().await;
-        for (_, path) in segments.iter() {
-            if path.exists() {
-                tokio::fs::remove_file(path).await.ok();
-            }
+        if !self.list_frame_files_on_disk().is_empty() {
+            return Err(LsmError::Io(std::io::Error::other(
+                "frame WAL truncation incomplete: residual frame_*.wal still on disk",
+            )));
         }
-        segments.clear();
-        drop(current_segment);
         self.rotate_segment().await
     }
 
@@ -658,8 +693,11 @@ impl FrameWalManager {
         if current_segment.is_none() {
             return Ok(false);
         }
-        let segments = self.segments.read().await;
-        Ok(segments.is_empty())
+        if !self.segments.read().await.is_empty() {
+            return Ok(false);
+        }
+        // At most one fresh frame file after wipe + rotate.
+        Ok(self.list_frame_files_on_disk().len() <= 1)
     }
 
     pub async fn mark_clean_shutdown(&self) -> Result<()> {

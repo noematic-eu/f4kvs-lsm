@@ -743,16 +743,34 @@ impl IndexedWalManager {
         }
     }
 
+    /// Wipe every frames segment directory under the WAL root after a successful
+    /// memtable flush — including residual dirs from prior process sessions that
+    /// were never re-registered into `self.segments`.
     pub async fn truncate_after_flush(&self) -> Result<()> {
-        let mut current = self.current_segment.write().await;
-        if let Some(segment) = current.take() {
-            Self::remove_frames_dir(segment.frames_dir()).await;
+        {
+            let mut current = self.current_segment.write().await;
+            if let Some(segment) = current.take() {
+                Self::remove_frames_dir(segment.frames_dir()).await;
+            }
         }
-        let mut segments = self.segments.write().await;
-        for (_, frames_dir) in segments.drain() {
-            Self::remove_frames_dir(&frames_dir).await;
+        {
+            let mut segments = self.segments.write().await;
+            for (_, frames_dir) in segments.drain() {
+                Self::remove_frames_dir(&frames_dir).await;
+            }
         }
-        drop(current);
+        // Filesystem-wide: residual hex-named dirs under frames/ from prior sessions.
+        let root = frames_root(&self.wal_dir);
+        if root.exists() {
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        Self::remove_frames_dir(&path).await;
+                    }
+                }
+            }
+        }
         if self.index_path.exists() {
             tokio::fs::remove_file(&self.index_path).await.ok();
         }
@@ -761,7 +779,23 @@ impl IndexedWalManager {
     }
 
     pub async fn verify_truncated(&self) -> Result<bool> {
-        Ok(self.segments.read().await.is_empty())
+        if !self.segments.read().await.is_empty() {
+            return Ok(false);
+        }
+        // After wipe + rotate there should be at most one active frames dir.
+        let root = frames_root(&self.wal_dir);
+        if !root.exists() {
+            return Ok(true);
+        }
+        let mut dirs = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    dirs += 1;
+                }
+            }
+        }
+        Ok(dirs <= 1)
     }
 
     pub async fn mark_clean_shutdown(&self) -> Result<()> {

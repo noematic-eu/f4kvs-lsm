@@ -470,6 +470,8 @@ impl LsmTreeEngine {
         // Recovery used to only accept (1), so compacted files were invisible after restart —
         // observed on the full-tier soak gate: anchors lived only in sstable_l0_t* and
         // returned 404 post-restart despite being on disk (see f4kvs-v2 soak-20260803T080810Z).
+        let mut failed_count = 0usize;
+        let mut candidate_count = 0usize;
         if let Ok(entries) = std::fs::read_dir(data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -482,27 +484,67 @@ impl LsmTreeEngine {
                         Some(level) => level,
                         None => continue,
                     };
+                    candidate_count += 1;
                     log::trace!("Processing SSTable file: {} (level {})", file_name, level);
-                    if let Ok(mut sstable) =
-                        SSTable::new(path.clone(), self.config.sstable.clone(), level)
-                    {
-                        match sstable.open().await {
-                            Ok(()) => {
-                                let level_sstables =
-                                    sstables.entry(level).or_insert_with(Vec::new);
-                                level_sstables.push(sstable);
-                                loaded_count += 1;
-                                info!("Loaded SSTable: {} (level {})", file_name, level);
-                            }
-                            Err(_) => {
-                                warn!("Failed to open SSTable: {}", file_name);
+                    match SSTable::new(path.clone(), self.config.sstable.clone(), level) {
+                        Ok(mut sstable) => {
+                            // Open → load index/metadata into memory → release FD.
+                            // Holding every handle open hits the process soft limit
+                            // (~8192 on macOS): ~8177 loaded, rest silently skipped
+                            // (comfort crash-loop 2026-08-12, Bug 3).
+                            let open_result = sstable.open().await;
+                            let open_result = match open_result {
+                                Ok(()) => Ok(()),
+                                Err(e) if Self::is_fd_exhaustion(&e) => {
+                                    // Defensive: close any still-open handles and retry once.
+                                    warn!(
+                                        "FD exhaustion opening {}: {}; closing open handles and retrying",
+                                        file_name, e
+                                    );
+                                    for level_sstables in sstables.values_mut() {
+                                        for s in level_sstables.iter_mut() {
+                                            s.close_file_handle().await;
+                                        }
+                                    }
+                                    sstable.open().await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            match open_result {
+                                Ok(()) => {
+                                    // Keep is_ready + index; drop OS FD for capacity.
+                                    sstable.close_file_handle().await;
+                                    let level_sstables =
+                                        sstables.entry(level).or_insert_with(Vec::new);
+                                    level_sstables.push(sstable);
+                                    loaded_count += 1;
+                                    info!("Loaded SSTable: {} (level {})", file_name, level);
+                                }
+                                Err(e) => {
+                                    failed_count += 1;
+                                    warn!(
+                                        "Failed to open SSTable {} (level {}): {}",
+                                        file_name, level, e
+                                    );
+                                }
                             }
                         }
-                    } else {
-                        log::debug!("Failed to create SSTable for file: {}", file_name);
+                        Err(e) => {
+                            failed_count += 1;
+                            warn!("Failed to create SSTable for {}: {}", file_name, e);
+                        }
                     }
                 }
             }
+        }
+
+        if failed_count > 0 {
+            warn!(
+                "SSTable load: {}/{} files failed to open (loaded={}) — data in those files is invisible until fixed",
+                failed_count,
+                candidate_count,
+                loaded_count
+            );
         }
 
         // sequence_number is shared for L0 filenames AND entry timestamps.
@@ -530,6 +572,8 @@ impl LsmTreeEngine {
                         );
                     }
                 }
+                // Release FD after scan so N SSTables do not accumulate open handles.
+                sstable.close_file_handle().await;
             }
         }
         let seq_file_hw = self.load_sequence_file().await.unwrap_or(0);
@@ -1505,12 +1549,39 @@ impl LsmTreeEngine {
     /// Caller must hold an [`SstableReadPin`] so LRU eviction cannot close the file
     /// between opening and reading.
     async fn ensure_sstable_open(&self, level: usize, idx: usize) {
-        let _ = self.ensure_file_handle_capacity().await;
+        if let Err(e) = self.ensure_file_handle_capacity().await {
+            warn!(
+                "ensure_file_handle_capacity failed before open L{}[{}]: {}",
+                level, idx, e
+            );
+        }
         let sstables = self.sstables.read().await;
         if let Some(level_sstables) = sstables.get(&level) {
             if let Some(sstable) = level_sstables.get(idx) {
-                let _ = sstable.ensure_file_open().await;
+                if let Err(e) = sstable.ensure_file_open().await {
+                    warn!(
+                        "Failed to ensure SSTable open L{}[{}] {:?}: {}",
+                        level,
+                        idx,
+                        sstable.path(),
+                        e
+                    );
+                }
             }
+        }
+    }
+
+    /// True when an I/O error is process FD exhaustion (EMFILE/ENFILE).
+    fn is_fd_exhaustion(err: &LsmError) -> bool {
+        match err {
+            LsmError::Io(io_err) => {
+                matches!(
+                    io_err.raw_os_error(),
+                    Some(24) /* EMFILE */ | Some(23) /* ENFILE */
+                ) || io_err.kind() == std::io::ErrorKind::OutOfMemory
+                    || format!("{io_err}").contains("Too many open files")
+            }
+            other => format!("{other}").contains("Too many open files"),
         }
     }
 
@@ -1654,7 +1725,7 @@ impl LsmTreeEngine {
                             });
                         }
                     }
-                    Err(e) => debug!("Error reading from SSTable L{level}[{idx}]: {e}"),
+                    Err(e) => warn!("Error reading from SSTable L{level}[{idx}]: {e}"),
                 }
             }
 
@@ -5317,6 +5388,303 @@ mod tests {
         assert_eq!(parse_sstable_level_from_filename("sstable.sst"), None);
     }
 
+    /// Empty WAL segment after truncate+SIGKILL must not refuse engine start.
+    /// Data lives in SSTables; zero-byte residual is "nothing to replay".
+    #[tokio::test]
+    async fn empty_wal_segment_after_truncate_does_not_block_recovery() {
+        let temp_dir = TempDir::new().expect("temp");
+        let data_dir = temp_dir.path().to_path_buf();
+        let wal_dir = data_dir.join("wal");
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            memtable: MemtableConfig::default(),
+            wal: WalConfig {
+                enabled: true,
+                dir: wal_dir.clone(),
+                segment_size: 1024 * 1024,
+                sync_mode: WalSyncMode::Fsync,
+                allow_recovery_failure: false,
+                ..Default::default()
+            },
+            sstable: SstableConfig::default(),
+            levels: LevelConfig::default(),
+            compaction: CompactionConfig::default(),
+            bloom_filter: BloomFilterConfig::default(),
+            column_families: ColumnFamilyConfig {
+                default_name: "default".to_string(),
+                enable_isolation: false,
+                max_count: 100,
+            },
+            performance: PerformanceConfig::default(),
+            adaptive_compaction: None,
+        };
+
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("session1");
+            engine
+                .put("k", &Value::String("v".into()))
+                .await
+                .expect("put");
+            engine.flush().await.expect("flush"); // truncates WAL, new empty segment
+        }
+
+        // Simulate SIGKILL before any post-truncate put: replace WAL with 0-byte file.
+        let _ = std::fs::remove_dir_all(&wal_dir);
+        std::fs::create_dir_all(&wal_dir).expect("wal dir");
+        std::fs::write(wal_dir.join("segment_00000000000000aa.wal"), b"").expect("empty wal");
+
+        let engine = LsmTreeEngine::new(config).await.expect("recover despite empty WAL");
+        let got = engine.get("k").await.expect("get");
+        assert_eq!(got, Some(Value::String("v".into())));
+    }
+
+    /// Bug 3 regression (comfort crash-loop 2026-08-12): recovery must register
+    /// every on-disk SSTable without holding all FDs open. Previously open-all
+    /// hit soft ulimit (~8192) → ~8177 loaded, rest silently skipped → invisible data.
+    #[tokio::test]
+    async fn load_existing_sstables_registers_all_and_releases_fds() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let n_files = 80usize; // enough to prove close-after-load; full ulimit is slow
+
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            memtable: MemtableConfig {
+                max_size: 512, // tiny → each put+flush creates its own L0
+                max_immutable_count: 2,
+                flush_threshold: 0.5,
+                use_skip_list: true,
+                concurrent_reads: true,
+            },
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            sstable: SstableConfig {
+                // Small target so flushes stay tiny files
+                target_size: 1024,
+                max_size: 64 * 1024,
+                max_open_files: 16, // force LRU pressure after reopen
+                ..Default::default()
+            },
+            levels: LevelConfig::default(),
+            compaction: CompactionConfig {
+                background_enabled: false, // keep L0 files, no merge-away
+                ..Default::default()
+            },
+            bloom_filter: BloomFilterConfig::default(),
+            column_families: ColumnFamilyConfig {
+                default_name: "default".to_string(),
+                enable_isolation: false,
+                max_count: 100,
+            },
+            performance: PerformanceConfig::default(),
+            adaptive_compaction: None,
+        };
+
+        // Session 1: many L0 flushes
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("engine session1");
+            for i in 0..n_files {
+                engine
+                    .put(
+                        &format!("k{i:04}"),
+                        &Value::String(format!("v{i}")),
+                    )
+                    .await
+                    .expect("put");
+                engine.flush().await.expect("flush");
+            }
+        }
+
+        let on_disk = std::fs::read_dir(&data_dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.ends_with(".sst"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            on_disk >= n_files,
+            "expected ≥{n_files} SST files on disk, found {on_disk}"
+        );
+
+        // Session 2: reopen — must load all candidates and leave FDs released.
+        let engine = LsmTreeEngine::new(config)
+            .await
+            .expect("engine session2");
+
+        let sstables = engine.sstables.read().await;
+        let mut loaded = 0usize;
+        let mut still_open = 0usize;
+        for level_sstables in sstables.values() {
+            for s in level_sstables {
+                loaded += 1;
+                assert!(s.is_ready(), "loaded SSTable must be ready: {:?}", s.path());
+                if s.is_open() {
+                    still_open += 1;
+                }
+            }
+        }
+        drop(sstables);
+
+        assert_eq!(
+            loaded, on_disk,
+            "every on-disk SST must be registered (was open-all EMFILE skip)"
+        );
+        assert_eq!(
+            still_open, 0,
+            "recovery must release FDs after index load (open={still_open})"
+        );
+
+        // Point lookups still work (lazy re-open).
+        for i in 0..n_files {
+            let got = engine
+                .get(&format!("k{i:04}"))
+                .await
+                .expect("get");
+            assert_eq!(got, Some(Value::String(format!("v{i}"))));
+        }
+    }
+
+    /// Regression (comfort crash-loop 2026-08-12): residual WAL segments left
+    /// after a prior incomplete truncate re-inject stale values on recovery,
+    /// which re-flush with higher sequence numbers and permanently win L0 merge.
+    ///
+    /// Scenario:
+    ///   1. Write + flush key=fresh into SST (authoritative).
+    ///   2. Inject a phantom residual segment_*.wal with key=stale (simulates
+    ///      prior-session residual never wiped by truncate).
+    ///   3. Reopen → recover phantom → put/overwrite not needed; flush again.
+    ///      Truncate must wipe the phantom so a second reopen never re-sees stale.
+    ///   4. Final reopen: get(key) == fresh (never stale).
+    #[tokio::test]
+    async fn residual_wal_segments_do_not_resurrect_stale_values() {
+        use crate::storage::wal::{WALEntry, WALManager};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let wal_dir = data_dir.join("wal");
+
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            memtable: MemtableConfig::default(),
+            wal: WalConfig {
+                enabled: true,
+                dir: wal_dir.clone(),
+                segment_size: 1024 * 1024,
+                sync_mode: WalSyncMode::Fsync,
+                ..Default::default()
+            },
+            sstable: SstableConfig::default(),
+            levels: LevelConfig::default(),
+            compaction: CompactionConfig::default(),
+            bloom_filter: BloomFilterConfig::default(),
+            column_families: ColumnFamilyConfig {
+                default_name: "default".to_string(),
+                enable_isolation: false,
+                max_count: 100,
+            },
+            performance: PerformanceConfig::default(),
+            adaptive_compaction: None,
+        };
+
+        // Session 1: authoritative fresh value on SST + clean WAL truncate.
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("engine session1");
+            engine
+                .put("churn:23", &Value::String("churn-iter-3".into()))
+                .await
+                .expect("put fresh");
+            engine.flush().await.expect("flush fresh");
+        }
+
+        // Inject a phantom residual segment that would re-apply an older value
+        // on recovery if truncate only wiped the "current" handle.
+        {
+            let phantom_cfg = WalConfig {
+                dir: wal_dir.clone(),
+                segment_size: 1024 * 1024,
+                sync_mode: WalSyncMode::Fsync,
+                ..Default::default()
+            };
+            // Residual segment left on disk (prior incomplete truncate).
+            let mgr = WALManager::new(&phantom_cfg).expect("wal mgr");
+            mgr.initialize().await.expect("wal init");
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            // Direct write of stale put into current segment, flush, then
+            // close manager without engine-level truncate.
+            mgr.write_entry(&WALEntry::Put {
+                key: "churn:23".into(),
+                value: Value::String("churn-iter-1".into()),
+                timestamp: ts.saturating_sub(3600), // older wall clock
+            })
+            .await
+            .expect("write stale phantom");
+            mgr.flush().await.expect("flush phantom wal");
+            // Leave the segment file(s) on disk by dropping without mark_clean_shutdown.
+            drop(mgr);
+        }
+
+        // Session 2: open (replays residual stale into memtable), flush.
+        // Full truncate must wipe residual so stale cannot reappear later.
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("engine session2");
+            // Overwrite with the correct fresh value again (simulates acked put
+            // after recovery), then flush — the gate that must wipe phantoms.
+            engine
+                .put("churn:23", &Value::String("churn-iter-3".into()))
+                .await
+                .expect("put fresh again");
+            engine.flush().await.expect("flush after recover");
+
+            // No residual segment_*.wal beyond the single fresh current.
+            let mut residual = 0usize;
+            if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("segment_") && name.ends_with(".wal") {
+                        residual += 1;
+                    }
+                }
+            }
+            assert!(
+                residual <= 1,
+                "after flush truncate expected ≤1 WAL segment, found {residual}"
+            );
+        }
+
+        // Session 3: reopen; value must stay fresh (stale must not resurrect).
+        {
+            let engine = LsmTreeEngine::new(config)
+                .await
+                .expect("engine session3");
+            let got = engine.get("churn:23").await.expect("get");
+            assert_eq!(
+                got,
+                Some(Value::String("churn-iter-3".into())),
+                "stale residual WAL re-applied after flush/reopen"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_sstable_flush_sequence_from_filename() {
         assert_eq!(
@@ -5591,6 +5959,140 @@ mod tests {
         assert!(
             saw_newer,
             "expected a new L0 SSTable with seq > {max_gen1} after post-restart flush"
+        );
+    }
+
+    /// Repro harness for the crash-loop tombstone resurrection
+    /// (RESURRECTION: acked-deleted key readable after SIGKILL).
+    /// Config mirrors the crash-loop phase: WAL Fsync, compaction off.
+    fn tombstone_repro_config(data_dir: std::path::PathBuf) -> LsmConfig {
+        LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                sync_mode: WalSyncMode::Fsync,
+                ..Default::default()
+            },
+            compaction: CompactionConfig {
+                background_enabled: false,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        }
+    }
+
+    /// FORENSIC (temporaire, à retirer): inspecte l'état on-disk réel du run
+    /// soak-20260812T131837Z pour la clé ressuscitée soak:cdel:49.
+    #[tokio::test]
+    async fn forensic_inspect_cdel49() {
+        let dir = std::path::PathBuf::from("/tmp/f4kvs-forensics-copy");
+        let files = [
+            "L0_0000000000000461.sst",
+            "L0_0000000000001b22.sst",
+            "L0_00000000000021bc.sst",
+            "L0_00000000000024e6.sst",
+            "L0_0000000000002d28.sst",
+            "L0_000000000000400d.sst",
+            "L0_0000000000004ced.sst",
+            "L0_00000000000053bf.sst",
+            "L0_00000000000061bc.sst",
+            "L0_0000000000006bca.sst",
+            "sstable_l0_t1786540989.sst",
+        ];
+        for name in files {
+            let path = dir.join(name);
+            let mut t = SSTable::new(path, SstableConfig::default(), 0).expect("new");
+            if let Err(e) = t.open().await {
+                println!("{name} OPEN ERR {e}");
+                continue;
+            }
+            println!(
+                "{name} ready={} range=[{:?}..{:?}] may_exist={}",
+                t.is_ready(),
+                t.metadata().smallest_key,
+                t.metadata().largest_key,
+                t.key_may_exist("soak:cdel:49")
+            );
+            match t.get_all_entries().await {
+                Ok(entries) => {
+                    for e in entries.iter().filter(|e| e.key == "soak:cdel:49") {
+                        println!(
+                            "  {name} => ts={} deleted={} value={:?}",
+                            e.timestamp, e.deleted, e.value
+                        );
+                    }
+                }
+                Err(e) => println!("  {name} READ ERR {e}"),
+            }
+        }
+    }
+
+    /// A: put -> flush (seed in SSTable) -> delete (tombstone ONLY in WAL)
+    /// -> simulated SIGKILL (mem::forget) -> reopen -> key must be gone.
+    #[tokio::test]
+    async fn test_delete_in_wal_only_survives_sigkill() {
+        use crate::Value;
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = tombstone_repro_config(data_dir);
+
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("create");
+            engine
+                .put("cdel:49", &Value::Bytes(b"seed-49".to_vec()))
+                .await
+                .expect("put seed");
+            engine.flush().await.expect("flush seed to SSTable");
+            engine.delete("cdel:49").await.expect("acked delete");
+            // No flush after delete: tombstone lives only in WAL + memtable.
+            std::mem::forget(engine); // SIGKILL: no shutdown, no Drop
+        }
+
+        let engine = LsmTreeEngine::new(config).await.expect("reopen");
+        let got = engine.get("cdel:49").await.expect("get after crash");
+        assert_eq!(
+            got, None,
+            "acked delete must survive SIGKILL via WAL replay; got {got:?}"
+        );
+    }
+
+    /// B: put -> flush -> delete -> another put + flush (tombstone lands in a
+    /// new SSTable, WAL wiped) -> SIGKILL -> reopen -> key must stay gone.
+    #[tokio::test]
+    async fn test_delete_flushed_then_sigkill_stays_deleted() {
+        use crate::Value;
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = tombstone_repro_config(data_dir);
+
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("create");
+            engine
+                .put("cdel:49", &Value::Bytes(b"seed-49".to_vec()))
+                .await
+                .expect("put seed");
+            engine.flush().await.expect("flush seed");
+            engine.delete("cdel:49").await.expect("acked delete");
+            // Subsequent traffic forces a flush that carries the tombstone.
+            engine
+                .put("other", &Value::Bytes(b"x".to_vec()))
+                .await
+                .expect("put other");
+            engine.flush().await.expect("flush tombstone");
+            std::mem::forget(engine); // SIGKILL
+        }
+
+        let engine = LsmTreeEngine::new(config).await.expect("reopen");
+        let got = engine.get("cdel:49").await.expect("get after crash");
+        assert_eq!(
+            got, None,
+            "flushed tombstone must win over older seed SSTable; got {got:?}"
         );
     }
 }
