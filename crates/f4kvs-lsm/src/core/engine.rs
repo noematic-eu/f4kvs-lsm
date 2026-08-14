@@ -17,13 +17,13 @@ use crate::{
     utils::LsmStats,
 };
 use async_trait::async_trait;
-use f4kvs_value::{F4KvsError, Value};
 use f4kvs_storage_core::{
     stats::StorageStats as F4KvsStorageStats,
     traits::{KeyValueIterator, StorageEngine},
 };
 #[cfg(feature = "ttl")]
 use f4kvs_ttl::TTLManager;
+use f4kvs_value::{F4KvsError, Value};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -265,8 +265,7 @@ impl LsmTreeEngine {
     }
 
     fn set_live_key_count(&self, count: u64) {
-        self.live_key_count
-            .store(count, Ordering::Release);
+        self.live_key_count.store(count, Ordering::Release);
     }
 
     fn adjust_live_key_count(&self, delta: i64) {
@@ -615,13 +614,11 @@ impl LsmTreeEngine {
         if !path.exists() {
             return Ok(0);
         }
-        let text = tokio::fs::read_to_string(&path).await.map_err(LsmError::Io)?;
+        let text = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(LsmError::Io)?;
         let value = text.trim().parse::<u64>().map_err(|e| {
-            LsmError::Corruption(format!(
-                "Invalid SEQUENCE file {}: {}",
-                path.display(),
-                e
-            ))
+            LsmError::Corruption(format!("Invalid SEQUENCE file {}: {}", path.display(), e))
         })?;
         Ok(value)
     }
@@ -699,18 +696,17 @@ impl LsmTreeEngine {
 
         // Use a timeout to prevent infinite loops
         let wal_engine = self.config.wal.engine;
-        let recovery_result =
-            tokio::time::timeout(self.config.wal.recovery_timeout, async {
-                let wal = self.wal_manager.read().await;
-                let all_entries = wal.read_entries_for_recovery().await?;
-                info!(
-                    "WAL recovery: read {} entries ({:?} engine)",
-                    all_entries.len(),
-                    wal_engine
-                );
-                Ok::<Vec<WALEntry>, LsmError>(all_entries)
-            })
-            .await;
+        let recovery_result = tokio::time::timeout(self.config.wal.recovery_timeout, async {
+            let wal = self.wal_manager.read().await;
+            let all_entries = wal.read_entries_for_recovery().await?;
+            info!(
+                "WAL recovery: read {} entries ({:?} engine)",
+                all_entries.len(),
+                wal_engine
+            );
+            Ok::<Vec<WALEntry>, LsmError>(all_entries)
+        })
+        .await;
 
         let entries = match recovery_result {
             Ok(Ok(entries)) => entries,
@@ -942,31 +938,22 @@ impl LsmTreeEngine {
             let shutdown = shutdown.clone();
 
             let handle = tokio::spawn(async move {
+                // Do not probe `operation_guard.try_write()` here: get/put hold
+                // the read side for the whole request, so under soak load the
+                // exclusive probe never succeeds (165114Z: 0 compact during 1h
+                // cache, 7883 L0 files at restart). Compaction I/O already
+                // snapshots and releases the SSTable map lock.
+                let _ = operation_guard;
                 let mut interval = tokio::time::interval(compaction_interval);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            if shutdown.load(Ordering::Relaxed) {
-                                debug!("Background compaction task shutting down");
-                                break;
-                            }
-                            // Skip when foreground operations hold the guard; do not keep the
-                            // write lock during compaction (that would block all reads/writes
-                            // for the full compaction duration).
-                            if operation_guard.try_write().is_err() {
-                                debug!("Skipping background compaction - operations in progress");
-                                continue;
-                            }
-                            if let Err(e) = compaction_manager.compact_if_needed(&sstables).await {
-                                warn!("Background compaction failed: {}", e);
-                            }
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            if shutdown.load(Ordering::Relaxed) {
-                                debug!("Background compaction task shutting down");
-                                break;
-                            }
-                        }
+                    interval.tick().await;
+                    if shutdown.load(Ordering::Relaxed) {
+                        debug!("Background compaction task shutting down");
+                        break;
+                    }
+                    if let Err(e) = compaction_manager.compact_if_needed(&sstables).await {
+                        warn!("Background compaction failed: {}", e);
                     }
                 }
             });
@@ -1170,9 +1157,16 @@ impl LsmTreeEngine {
     /// 6. Flushes old memtable to SSTable (while it remains in immutable list for reads)
     /// 7. Removes old memtable from immutable list after flush completes
     async fn flush_memtable(&self) -> Result<()> {
-        // Acquire read lock to prevent compaction during flush
-        let _op_guard = self.operation_guard.read().await;
-        self.flush_memtable_internal().await
+        {
+            let _op_guard = self.operation_guard.read().await;
+            self.flush_memtable_internal().await?;
+        }
+        // Compact after dropping the read guard — L0 merge does not need
+        // exclusive access, and holding the guard starved it (see soak 165114Z).
+        if let Err(e) = self.compact_if_needed().await {
+            warn!("Post-flush compaction failed: {}", e);
+        }
+        Ok(())
     }
 
     /// Internal flush without operation guard (used when caller already holds the lock)
@@ -1248,9 +1242,8 @@ impl LsmTreeEngine {
                 let flush_duration = flush_start.elapsed();
                 record_memtable_flush(&self.metrics, old_memtable_entry_count, flush_duration);
             }
-
-            // Trigger compaction after flush
-            self.compact_if_needed().await?;
+            // Compaction is triggered by flush_memtable() / StorageEngine::flush()
+            // after they drop operation_guard — not here (callers often hold it).
         } else {
             // Old memtable is empty, no need to flush
             drop(active);
@@ -2088,7 +2081,10 @@ impl StorageEngine for LsmTreeEngine {
             for (key, value) in &items {
                 let effect = {
                     let mut memtable = self.active_memtable.write().await;
-                    memtable.put(key, value).await.map_err(Self::convert_error)?
+                    memtable
+                        .put(key, value)
+                        .await
+                        .map_err(Self::convert_error)?
                 };
                 effects.push((key.clone(), effect));
             }
@@ -3226,6 +3222,13 @@ impl StorageEngine for LsmTreeEngine {
         }
 
         tracing::info!("LSM Engine: Flush operation completed successfully");
+        drop(_op_guard);
+
+        // Buffer-pool soak flushes hold the exclusive guard; compact only after
+        // release so L0 can drain without blocking the write path.
+        if let Err(e) = self.compact_if_needed().await {
+            warn!("Post-flush compaction failed: {}", e);
+        }
         Ok(())
     }
 
@@ -3342,20 +3345,11 @@ impl LsmTreeEngine {
         Ok(cf_map.clone())
     }
 
-    /// Check if compaction is needed and run it
+    /// Check if compaction is needed and run it.
+    ///
+    /// Must not take `operation_guard` write: get/put/scan hold the read side
+    /// for the whole request, so `try_write` never succeeds under load.
     async fn compact_if_needed(&self) -> Result<()> {
-        // Try to acquire write lock for exclusive compaction access
-        // Use try_write to avoid blocking if other operations are in progress
-        let op_guard = self.operation_guard.try_write();
-        let _op_guard = match op_guard {
-            Ok(guard) => guard,
-            Err(_) => {
-                // Another operation is in progress, skip compaction for now
-                debug!("Skipping compaction - other operations in progress");
-                return Ok(());
-            }
-        };
-
         let compaction_start = Instant::now();
 
         self.compaction_manager
@@ -4346,7 +4340,11 @@ mod tests {
             .await
             .expect("Failed to reopen engine");
         assert!(
-            recovered.get("idle-key").await.expect("get failed").is_some(),
+            recovered
+                .get("idle-key")
+                .await
+                .expect("get failed")
+                .is_some(),
             "idle flush should persist WAL before shutdown"
         );
     }
@@ -4376,10 +4374,7 @@ mod tests {
 
         for i in 0..64 {
             engine
-                .put(
-                    &format!("gc_key_{i}"),
-                    &Value::Bytes(vec![b'x'; 256]),
-                )
+                .put(&format!("gc_key_{i}"), &Value::Bytes(vec![b'x'; 256]))
                 .await
                 .expect("group commit put failed");
         }
@@ -5430,9 +5425,7 @@ mod tests {
         };
 
         {
-            let engine = LsmTreeEngine::new(config.clone())
-                .await
-                .expect("session1");
+            let engine = LsmTreeEngine::new(config.clone()).await.expect("session1");
             engine
                 .put("k", &Value::String("v".into()))
                 .await
@@ -5445,7 +5438,9 @@ mod tests {
         std::fs::create_dir_all(&wal_dir).expect("wal dir");
         std::fs::write(wal_dir.join("segment_00000000000000aa.wal"), b"").expect("empty wal");
 
-        let engine = LsmTreeEngine::new(config).await.expect("recover despite empty WAL");
+        let engine = LsmTreeEngine::new(config)
+            .await
+            .expect("recover despite empty WAL");
         let got = engine.get("k").await.expect("get");
         assert_eq!(got, Some(Value::String("v".into())));
     }
@@ -5503,10 +5498,7 @@ mod tests {
                 .expect("engine session1");
             for i in 0..n_files {
                 engine
-                    .put(
-                        &format!("k{i:04}"),
-                        &Value::String(format!("v{i}")),
-                    )
+                    .put(&format!("k{i:04}"), &Value::String(format!("v{i}")))
                     .await
                     .expect("put");
                 engine.flush().await.expect("flush");
@@ -5529,9 +5521,7 @@ mod tests {
         );
 
         // Session 2: reopen — must load all candidates and leave FDs released.
-        let engine = LsmTreeEngine::new(config)
-            .await
-            .expect("engine session2");
+        let engine = LsmTreeEngine::new(config).await.expect("engine session2");
 
         let sstables = engine.sstables.read().await;
         let mut loaded = 0usize;
@@ -5558,10 +5548,7 @@ mod tests {
 
         // Point lookups still work (lazy re-open).
         for i in 0..n_files {
-            let got = engine
-                .get(&format!("k{i:04}"))
-                .await
-                .expect("get");
+            let got = engine.get(&format!("k{i:04}")).await.expect("get");
             assert_eq!(got, Some(Value::String(format!("v{i}"))));
         }
     }
@@ -5683,9 +5670,7 @@ mod tests {
 
         // Session 3: reopen; value must stay fresh (stale must not resurrect).
         {
-            let engine = LsmTreeEngine::new(config)
-                .await
-                .expect("engine session3");
+            let engine = LsmTreeEngine::new(config).await.expect("engine session3");
             let got = engine.get("churn:23").await.expect("get");
             assert_eq!(
                 got,
@@ -5782,9 +5767,7 @@ mod tests {
         // Phase 2: reopen (sequence must resume above entry timestamps), overwrite
         // then delete, flush, compact — old value must not reappear.
         {
-            let engine = LsmTreeEngine::new(config.clone())
-                .await
-                .expect("reopen");
+            let engine = LsmTreeEngine::new(config.clone()).await.expect("reopen");
             // SEQUENCE / entry-ts watermark must exceed the pre-restart max.
             let seq = engine.sequence_number.load(Ordering::SeqCst);
             assert!(
@@ -6003,9 +5986,7 @@ mod tests {
         let config = tombstone_repro_config(data_dir);
 
         {
-            let engine = LsmTreeEngine::new(config.clone())
-                .await
-                .expect("create");
+            let engine = LsmTreeEngine::new(config.clone()).await.expect("create");
             engine
                 .put("cdel:49", &Value::Bytes(b"seed-49".to_vec()))
                 .await
@@ -6034,9 +6015,7 @@ mod tests {
         let config = tombstone_repro_config(data_dir);
 
         {
-            let engine = LsmTreeEngine::new(config.clone())
-                .await
-                .expect("create");
+            let engine = LsmTreeEngine::new(config.clone()).await.expect("create");
             engine
                 .put("cdel:49", &Value::Bytes(b"seed-49".to_vec()))
                 .await
@@ -6071,9 +6050,7 @@ mod tests {
         let config = tombstone_repro_config(data_dir);
 
         {
-            let engine = LsmTreeEngine::new(config.clone())
-                .await
-                .expect("create");
+            let engine = LsmTreeEngine::new(config.clone()).await.expect("create");
             engine
                 .put("cdel:49", &Value::Bytes(b"seed-49".to_vec()))
                 .await
@@ -6085,10 +6062,7 @@ mod tests {
                 engine.delete("cdel:49").await.expect("acked delete");
                 // More traffic + full flush (mirrors force_durable barrier).
                 engine
-                    .put(
-                        &format!("other:{round}"),
-                        &Value::Bytes(b"x".to_vec()),
-                    )
+                    .put(&format!("other:{round}"), &Value::Bytes(b"x".to_vec()))
                     .await
                     .expect("put other");
                 engine.flush().await.expect("full flush");
@@ -6118,9 +6092,7 @@ mod tests {
         config.memtable.max_size = 512;
 
         {
-            let engine = LsmTreeEngine::new(config.clone())
-                .await
-                .expect("create");
+            let engine = LsmTreeEngine::new(config.clone()).await.expect("create");
             engine
                 .put("soak:cdel:49", &Value::Bytes(b"cdel-seed-49".to_vec()))
                 .await
@@ -6136,10 +6108,7 @@ mod tests {
                     engine.flush().await.expect("flush");
                 }
             }
-            engine
-                .delete("soak:cdel:49")
-                .await
-                .expect("delete");
+            engine.delete("soak:cdel:49").await.expect("delete");
             // Force tombstone into an L0 file.
             engine
                 .put("trailer", &Value::Bytes(b"t".to_vec()))
@@ -6157,5 +6126,86 @@ mod tests {
             got, None,
             "tombstone must win after many L0 + compaction + restart; got {got:?}"
         );
+    }
+
+    /// Soak 165114Z: 0 background compact during 1h cache because get/put held
+    /// `operation_guard` read and `try_write` skipped every tick. L0 must still
+    /// drain while readers are in flight.
+    #[tokio::test]
+    async fn compaction_drains_l0_under_concurrent_reads() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            levels: LevelConfig {
+                max_sstables_per_level: 3,
+                ..Default::default()
+            },
+            compaction: CompactionConfig {
+                background_enabled: true,
+                interval: Duration::from_millis(30),
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        };
+
+        let engine = std::sync::Arc::new(LsmTreeEngine::new(config).await.expect("engine"));
+
+        for i in 0..16 {
+            engine
+                .put(
+                    &format!("k{i}"),
+                    &Value::Bytes(format!("v{i}").into_bytes()),
+                )
+                .await
+                .expect("put");
+            engine.flush().await.expect("flush");
+        }
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let e = engine.clone();
+            let stop = stop.clone();
+            readers.push(tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = e.get("k0").await;
+                }
+            }));
+        }
+
+        for i in 16..32 {
+            engine
+                .put(
+                    &format!("k{i}"),
+                    &Value::Bytes(format!("v{i}").into_bytes()),
+                )
+                .await
+                .expect("put");
+            engine.flush().await.expect("flush");
+        }
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        stop.store(true, Ordering::Relaxed);
+        for h in readers {
+            let _ = h.await;
+        }
+
+        let sstables = engine.sstables.read().await;
+        let l0 = sstables.get(&0).map(|v| v.len()).unwrap_or(0);
+        drop(sstables);
+        assert!(
+            l0 <= 12,
+            "L0 must compact under concurrent gets (soak cache pattern); got {l0}"
+        );
+
+        let got = engine.get("k0").await.expect("get after compact");
+        assert!(got.is_some(), "key must survive L0 drain");
     }
 }

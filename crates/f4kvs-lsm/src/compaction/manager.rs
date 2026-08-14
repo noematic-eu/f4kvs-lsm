@@ -10,6 +10,7 @@ use crate::utils;
 use f4kvs_value::F4KvsError;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{RwLock, Semaphore};
@@ -48,6 +49,8 @@ pub struct CompactionManager {
     last_workload_update: Arc<RwLock<Instant>>,
     /// Semaphore to limit concurrent SSTable operations during compaction
     compaction_semaphore: Arc<Semaphore>,
+    /// One in-flight `compact_if_needed` at a time (background + post-flush).
+    compacting: AtomicBool,
 }
 
 impl CompactionManager {
@@ -67,6 +70,7 @@ impl CompactionManager {
             adaptive_manager: None,
             last_workload_update: Arc::new(RwLock::new(Instant::now())),
             compaction_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SSTABLE_OPS)),
+            compacting: AtomicBool::new(false),
         })
     }
 
@@ -94,6 +98,7 @@ impl CompactionManager {
             adaptive_manager: Some(Arc::new(adaptive_manager)),
             last_workload_update: Arc::new(RwLock::new(Instant::now())),
             compaction_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SSTABLE_OPS)),
+            compacting: AtomicBool::new(false),
         })
     }
 
@@ -158,6 +163,23 @@ impl CompactionManager {
     /// 3. Uses try_write with retries to avoid blocking other operations
     /// 4. Releases lock quickly after compaction to allow reads to proceed
     pub async fn compact_if_needed(
+        &self,
+        sstables: &Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
+    ) -> Result<()> {
+        if self
+            .compacting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            debug!("Skipping compaction — already in progress");
+            return Ok(());
+        }
+        let result = self.compact_if_needed_inner(sstables).await;
+        self.compacting.store(false, Ordering::Release);
+        result
+    }
+
+    async fn compact_if_needed_inner(
         &self,
         sstables: &Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
     ) -> Result<()> {
