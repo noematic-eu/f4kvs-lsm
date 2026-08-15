@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::time::{sleep, Duration};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Bloom filter implementation for SSTables
 ///
@@ -758,10 +758,7 @@ impl SSTable {
             let read_size = std::cmp::min(pos, buffer.len() as u64) as usize;
             pos -= read_size as u64;
 
-            let bytes_read = self
-                .reader
-                .read_at(pos, &mut buffer[..read_size])
-                .await?;
+            let bytes_read = self.reader.read_at(pos, &mut buffer[..read_size]).await?;
 
             for i in (0..bytes_read.saturating_sub(4)).rev() {
                 if let Ok(metadata) =
@@ -780,10 +777,7 @@ impl SSTable {
         }
 
         let metadata_checksum_offset = metadata_offset + metadata_size as u64;
-        let stored_metadata_checksum = self
-            .reader
-            .read_u32_le_at(metadata_checksum_offset)
-            .await?;
+        let stored_metadata_checksum = self.reader.read_u32_le_at(metadata_checksum_offset).await?;
 
         let mut metadata_buffer = vec![0u8; metadata_size];
         self.reader
@@ -810,10 +804,7 @@ impl SSTable {
             .read_exact_at(index_start, &mut index_buffer)
             .await?;
 
-        let stored_index_checksum = self
-            .reader
-            .read_u32_le_at(index_start + index_size)
-            .await?;
+        let stored_index_checksum = self.reader.read_u32_le_at(index_start + index_size).await?;
 
         let mut index_hasher = Crc32Hasher::new();
         index_hasher.update(&index_buffer);
@@ -1435,6 +1426,30 @@ impl SSTable {
     pub fn mark_for_deletion(&self) {
         self.marked_for_deletion
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Unlink the file once marked and idle. New SST outputs are `sync_all`'d
+    /// before this is called. Missing path is success (already reclaimed).
+    pub async fn unlink_from_disk(&self) -> Result<()> {
+        if !self.is_marked_for_deletion() {
+            return Ok(());
+        }
+        if !self.can_delete() {
+            return Err(LsmError::Internal(format!(
+                "SSTable {:?} still has {} readers",
+                self.path,
+                self.reader_count()
+            )));
+        }
+        self.close_file_handle().await;
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => {
+                debug!("Unlinked compacted SSTable {:?}", self.path);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(LsmError::Io(e)),
+        }
     }
 
     /// Check if marked for deletion

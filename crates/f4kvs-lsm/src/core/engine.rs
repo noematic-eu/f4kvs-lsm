@@ -6208,4 +6208,67 @@ mod tests {
         let got = engine.get("k0").await.expect("get after compact");
         assert!(got.is_some(), "key must survive L0 drain");
     }
+
+    /// Soak 203321Z: live L0 stayed at 11 but restart loaded 8606 files because
+    /// compaction only set an in-memory deletion flag. Inputs must be unlinked.
+    #[tokio::test]
+    async fn compaction_unlinks_obsolete_sst_files() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            levels: LevelConfig {
+                max_sstables_per_level: 3,
+                ..Default::default()
+            },
+            compaction: CompactionConfig {
+                background_enabled: false,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        };
+
+        let engine = LsmTreeEngine::new(config).await.expect("engine");
+        for i in 0..24 {
+            engine
+                .put(
+                    &format!("k{i}"),
+                    &Value::Bytes(format!("v{i}").into_bytes()),
+                )
+                .await
+                .expect("put");
+            engine.flush().await.expect("flush");
+        }
+
+        let on_disk = std::fs::read_dir(&data_dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.ends_with(".sst"))
+                    .unwrap_or(false)
+            })
+            .count();
+        let sstables = engine.sstables.read().await;
+        let live: usize = sstables.values().map(|v| v.len()).sum();
+        drop(sstables);
+
+        assert!(
+            on_disk <= live + 2,
+            "obsolete SST files must be unlinked (disk={on_disk} live={live})"
+        );
+        assert!(
+            on_disk < 16,
+            "24 flush+compact cycles must not leave 24+ files; got {on_disk}"
+        );
+        let got = engine.get("k0").await.expect("get");
+        assert!(got.is_some(), "oldest key must survive file GC");
+    }
 }

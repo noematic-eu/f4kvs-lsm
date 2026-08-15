@@ -455,7 +455,8 @@ impl CompactionManager {
                 let mut merged = compacted_sstables;
                 merged.extend(concurrent);
                 sstables_guard.insert(level, merged);
-                // Lock released here, allowing other operations to proceed
+                drop(sstables_guard);
+                self.reclaim_compacted_inputs(&valid_sstables).await;
             }
         }
 
@@ -757,6 +758,33 @@ impl CompactionManager {
         time_groups.values().any(|group| group.len() > 1)
     }
 
+    /// Mark inputs obsolete, wait out readers, then unlink. Skip unlink if
+    /// readers remain so in-flight gets are not failed; those files stay as
+    /// restart ghosts until a later successful reclaim.
+    async fn reclaim_compacted_inputs(&self, inputs: &[SSTable]) {
+        for sstable in inputs {
+            sstable.mark_for_deletion();
+        }
+        let reader_wait = Duration::from_secs(5);
+        for sstable in inputs {
+            if !sstable.wait_for_readers(reader_wait).await {
+                warn!(
+                    "SSTable {:?} still has {} readers; leaving file on disk",
+                    sstable.path(),
+                    sstable.reader_count()
+                );
+                continue;
+            }
+            if let Err(e) = sstable.unlink_from_disk().await {
+                warn!(
+                    "Failed to unlink compacted SSTable {:?}: {}",
+                    sstable.path(),
+                    e
+                );
+            }
+        }
+    }
+
     /// Run compaction for a specific level
     pub async fn compact_level(
         &self,
@@ -824,61 +852,9 @@ impl CompactionManager {
             level, stats.entries_processed, stats.space_reclaimed
         );
 
-        // IMPORTANT: Mark SSTables for deletion AFTER reading all entries
-        // This ensures compaction can read from SSTables without interference
-        // We mark for deletion only after we've successfully read all the data we need
-
-        // Wait for any in-flight reads to complete before marking for deletion
-        // This gives readers a chance to finish before we mark the SSTable for deletion
-        let pre_mark_wait = Duration::from_millis(100);
-        for sstable in &sstables_to_compact {
-            let initial_reader_count = sstable.reader_count();
-            if initial_reader_count > 0 {
-                debug!(
-                    "Waiting for {} readers to complete before marking SSTable {:?} for deletion",
-                    initial_reader_count,
-                    sstable.path()
-                );
-                // Wait a short time for readers to finish
-                tokio::time::sleep(pre_mark_wait).await;
-            }
-        }
-
-        // Now mark SSTables for deletion - this prevents new reads from starting
-        // Existing reads will complete and decrement the reader count
-        for sstable in &sstables_to_compact {
-            sstable.mark_for_deletion();
-            debug!(
-                "Marked SSTable {:?} for deletion (reader_count: {})",
-                sstable.path(),
-                sstable.reader_count()
-            );
-        }
-
-        // Wait for all readers to complete (with timeout)
-        // Default timeout: 5 seconds
-        let reader_wait_timeout = Duration::from_secs(5);
-        let mut all_readers_done = true;
-
-        for sstable in &sstables_to_compact {
-            if !sstable.wait_for_readers(reader_wait_timeout).await {
-                warn!(
-                    "SSTable {:?} still has {} active readers after timeout, proceeding with deletion",
-                    sstable.path(),
-                    sstable.reader_count()
-                );
-                all_readers_done = false;
-            } else {
-                debug!("All readers completed for SSTable {:?}", sstable.path());
-            }
-        }
-
-        if !all_readers_done {
-            warn!(
-                "Some SSTables still have active readers after timeout. \
-                They will be removed from the index but may still be accessible to in-flight reads."
-            );
-        }
+        // Outputs are already sync_all'd. Drop inputs from disk so restart
+        // does not reload thousands of obsolete L0 files (soak 203321Z).
+        self.reclaim_compacted_inputs(&sstables_to_compact).await;
 
         // Return remaining SSTables + new ones
         // Filter out SSTables that were compacted (marked for deletion)
