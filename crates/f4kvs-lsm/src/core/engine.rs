@@ -727,15 +727,13 @@ impl LsmTreeEngine {
         if high_water > 0 || loaded_count > 0 {
             let next = high_water.saturating_add(1);
             self.sequence_number.store(next, Ordering::SeqCst);
-            // Persist so the next crash recovery has the watermark even if
-            // entry scans are skipped or incomplete.
-            if let Err(e) = self.persist_sequence_file(next).await {
-                warn!("Failed to persist SEQUENCE high-water mark: {}", e);
+            // Rewrite SEQUENCE only when the watermark moved. Every open used
+            // to fsync the same value (~10ms × N shards on catalog browse).
+            if next > seq_file_hw {
+                if let Err(e) = self.persist_sequence_file(next).await {
+                    warn!("Failed to persist SEQUENCE high-water mark: {}", e);
+                }
             }
-            info!(
-                "Advanced flush sequence_number to {} (max_flush_seq={}, max_entry_ts={}, sequence_file={})",
-                next, max_flush_seq, max_entry_ts, seq_file_hw
-            );
         }
 
         log::debug!("Total SSTables loaded: {}", loaded_count);

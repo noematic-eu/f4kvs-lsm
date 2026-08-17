@@ -3,12 +3,13 @@
 use crate::core::config::SstableConfig;
 use crate::error::{LsmError, Result};
 use crate::storage::file_reader::SstableFileReader;
+use crate::storage::flat_index::FlatIndex;
 use crate::storage::SharedBlockCache;
 use crate::utils;
 use crc32fast::Hasher as Crc32Hasher;
 use f4kvs_value::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+
 use std::path::PathBuf;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -418,7 +419,7 @@ pub struct SSTable {
     metadata: SSTableMetadata,
 
     /// In-memory index for fast lookups
-    index: BTreeMap<String, (u64, u32)>,
+    index: FlatIndex,
 
     /// Bloom filter for fast key existence checks
     bloom_filter: Option<BloomFilter>,
@@ -468,7 +469,7 @@ impl SSTable {
             path,
             config,
             metadata,
-            index: BTreeMap::new(),
+            index: FlatIndex::default(),
             bloom_filter: None,
             reader,
             last_access: std::sync::atomic::AtomicU64::new(0),
@@ -512,6 +513,7 @@ impl SSTable {
         // Write entries with checksums
         let mut offset = 0u64;
         let mut file_hasher = Crc32Hasher::new();
+        let mut index_pairs: Vec<(String, u64, u32)> = Vec::with_capacity(entries.len());
 
         for entry in &entries {
             let entry_data = bincode::serialize(entry).map_err(|e| {
@@ -548,8 +550,7 @@ impl SSTable {
 
             // Store in index (offset and size including checksum)
             let total_entry_size = 4 + entry_size + 4; // size + data + checksum
-            self.index
-                .insert(entry.key.clone(), (offset, total_entry_size));
+            index_pairs.push((entry.key.clone(), offset, total_entry_size));
             offset += total_entry_size as u64;
         }
 
@@ -557,9 +558,8 @@ impl SSTable {
         self.metadata.file_size = offset;
         self.metadata.index_offset = offset;
 
-        // Write index with checksum
-        let index_data = bincode::serialize(&self.index)
-            .map_err(|e| LsmError::Serialization(format!("Failed to serialize index: {}", e)))?;
+        self.index = FlatIndex::from_sorted(index_pairs);
+        let index_data = self.index.encode();
 
         self.metadata.index_size = index_data.len() as u64;
 
@@ -792,65 +792,13 @@ impl SSTable {
             )));
         }
 
-        self.index = bincode::deserialize(&index_buffer)
-            .map_err(|e| LsmError::Serialization(format!("Failed to deserialize index: {}", e)))?;
+        self.index = FlatIndex::decode(&index_buffer)?;
 
-        let bloom_filter_start = self.metadata.bloom_filter_offset;
-        let bloom_filter_size = self.metadata.bloom_filter_size;
-
-        if bloom_filter_size > 0 {
-            let mut bloom_filter_buffer = vec![0u8; bloom_filter_size as usize];
-            self.reader
-                .read_exact_at_blocking(bloom_filter_start, &mut bloom_filter_buffer)?;
-
-            let stored_bloom_checksum = self
-                .reader
-                .read_u32_le_at_blocking(bloom_filter_start + bloom_filter_size)?;
-
-            // Validate bloom filter checksum
-            let mut bloom_hasher = Crc32Hasher::new();
-            bloom_hasher.update(&bloom_filter_buffer);
-            let computed_bloom_checksum = bloom_hasher.finalize();
-
-            if stored_bloom_checksum != computed_bloom_checksum {
-                warn!(
-                    "SSTable bloom filter checksum mismatch: stored={}, computed={}. \
-                    Bloom filter may be corrupted, continuing without it.",
-                    stored_bloom_checksum, computed_bloom_checksum
-                );
-                // Continue without bloom filter - it's not critical for correctness
-                self.bloom_filter = None;
-            } else {
-                // Checksum is valid, try to load bloom filter
-                match Self::try_load_bloom_filter(
-                    &bloom_filter_buffer,
-                    self.metadata.bloom_filter_hash_count,
-                ) {
-                    Ok(filter) => {
-                        // Validate the loaded bloom filter
-                        if filter.is_valid() {
-                            self.bloom_filter = Some(filter);
-                        } else {
-                            warn!("Loaded bloom filter is invalid, continuing without it");
-                            self.bloom_filter = None;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to load bloom filter: {}, continuing without it", e);
-                        self.bloom_filter = None;
-                    }
-                }
-            }
-        }
+        // Bloom is optional (index is authoritative). Loading Vec<bool> filters
+        // on every shard open dominated catalog browse; skip it.
+        self.bloom_filter = None;
 
         Ok(())
-    }
-
-    /// Try to load bloom filter from file with error handling
-    /// Load bloom filter from bytes (helper for checksum-validated loading)
-    fn try_load_bloom_filter(bloom_filter_buffer: &[u8], hash_count: usize) -> Result<BloomFilter> {
-        let filter = BloomFilter::from_bytes(bloom_filter_buffer, hash_count);
-        Ok(filter)
     }
 
     /// Fast check: key could exist in this SSTable (range + bloom). Does not touch the file.
@@ -918,7 +866,7 @@ impl SSTable {
             return Ok(SstableLookupResult::Missing);
         }
         self.update_last_access();
-        let Some(&(offset, size)) = self.index.get(key) else {
+        let Some((offset, size)) = self.index.get(key) else {
             return Ok(SstableLookupResult::Missing);
         };
         if self.metadata.index_offset == 0
@@ -1072,7 +1020,7 @@ impl SSTable {
         let (offset, size) = match self.index.get(key) {
             Some(entry) => {
                 log::trace!("Found key '{}' in index at offset {}", key, entry.0);
-                let (offset, size) = *entry;
+                let (offset, size) = entry;
 
                 // CRITICAL: Validate that the index offset is reasonable
                 // The offset should be within the data section (before index_offset)
@@ -1117,11 +1065,6 @@ impl SSTable {
             }
             None => {
                 log::trace!("Key '{}' not found in index", key);
-                log::trace!(
-                    "Available keys in index: {:?}",
-                    self.index.keys().collect::<Vec<_>>()
-                );
-                // Decrement reader count before returning
                 guard.decrement();
                 return Ok(SstableLookupResult::Missing);
             }
@@ -1541,14 +1484,16 @@ impl SSTable {
     /// Scan keys with a prefix
     pub async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
-
-        for (key, _) in self.index.range(prefix.to_string()..) {
-            if !key.starts_with(prefix) {
+        let pb = prefix.as_bytes();
+        for i in self.index.partition_point(pb)..self.index.len() {
+            let Some((key, _)) = self.index.at(i) else {
+                break;
+            };
+            if !key.starts_with(pb) {
                 break;
             }
-            keys.push(key.clone());
+            keys.push(String::from_utf8_lossy(key).into_owned());
         }
-
         Ok(keys)
     }
 
@@ -1570,12 +1515,20 @@ impl SSTable {
         self.ensure_file_open().await?;
 
         let mut entries = Vec::new();
-        for (key, (offset, _)) in self.index.range(prefix.to_string()..) {
-            if !key.starts_with(prefix) {
+        let pb = prefix.as_bytes();
+        for i in self.index.partition_point(pb)..self.index.len() {
+            let Some((key, (offset, _))) = self.index.at(i) else {
+                break;
+            };
+            if !key.starts_with(pb) {
                 break;
             }
-            if let Ok(entry) = self.try_read_entry(*offset, None).await {
-                entries.push((key.clone(), entry.value, entry.deleted));
+            if let Ok(entry) = self.try_read_entry(offset, None).await {
+                entries.push((
+                    String::from_utf8_lossy(key).into_owned(),
+                    entry.value,
+                    entry.deleted,
+                ));
             }
         }
         Ok(entries)
@@ -1594,18 +1547,22 @@ impl SSTable {
 
         let mut entries = Vec::new();
         let end_bound = crate::utils::exclusive_range_end(end);
-
-        if let Some(end_bound) = end_bound {
-            for (key, (offset, _)) in self.index.range(start.to_string()..end_bound) {
-                if let Ok(entry) = self.try_read_entry(*offset, None).await {
-                    entries.push((key.clone(), entry.value, entry.deleted));
+        let start_i = self.index.partition_point(start.as_bytes());
+        for i in start_i..self.index.len() {
+            let Some((key, (offset, _))) = self.index.at(i) else {
+                break;
+            };
+            if let Some(ref end_bound) = end_bound {
+                if key >= end_bound.as_bytes() {
+                    break;
                 }
             }
-        } else {
-            for (key, (offset, _)) in self.index.range(start.to_string()..) {
-                if let Ok(entry) = self.try_read_entry(*offset, None).await {
-                    entries.push((key.clone(), entry.value, entry.deleted));
-                }
+            if let Ok(entry) = self.try_read_entry(offset, None).await {
+                entries.push((
+                    String::from_utf8_lossy(key).into_owned(),
+                    entry.value,
+                    entry.deleted,
+                ));
             }
         }
         Ok(entries)
@@ -1615,9 +1572,16 @@ impl SSTable {
     pub async fn scan_all(&self) -> Result<Vec<(String, Value, bool)>> {
         let mut entries = Vec::new();
 
-        for (key, (offset, _)) in &self.index {
-            if let Ok(entry) = self.try_read_entry(*offset, None).await {
-                entries.push((key.clone(), entry.value, entry.deleted));
+        for i in 0..self.index.len() {
+            let Some((key, (offset, _))) = self.index.at(i) else {
+                break;
+            };
+            if let Ok(entry) = self.try_read_entry(offset, None).await {
+                entries.push((
+                    String::from_utf8_lossy(key).into_owned(),
+                    entry.value,
+                    entry.deleted,
+                ));
             }
         }
 
@@ -1647,7 +1611,10 @@ impl SSTable {
         let mut entries = Vec::with_capacity(expected);
 
         // Iterate over index - this is safe as the index is only modified during SSTable creation
-        for (key, (offset, size)) in &self.index {
+        for i in 0..self.index.len() {
+            let Some((key, (offset, size))) = self.index.at(i) else {
+                break;
+            };
             if self.is_marked_for_deletion() {
                 return Err(LsmError::Internal(format!(
                     "SSTable {:?} marked for deletion during get_all_entries (got {} of {})",
@@ -1657,26 +1624,34 @@ impl SSTable {
                 )));
             }
 
-            if *offset > self.metadata.file_size {
+            if offset > self.metadata.file_size {
                 return Err(LsmError::Internal(format!(
                     "Invalid offset {} for key '{}' in {:?} (file size {})",
-                    offset, key, self.path, self.metadata.file_size
+                    offset,
+                    String::from_utf8_lossy(key),
+                    self.path,
+                    self.metadata.file_size
                 )));
             }
 
-            if *size == 0 || *size > 100 * 1024 * 1024 {
+            if size == 0 || size > 100 * 1024 * 1024 {
                 return Err(LsmError::Internal(format!(
                     "Invalid entry size {} for key '{}' in {:?}",
-                    size, key, self.path
+                    size,
+                    String::from_utf8_lossy(key),
+                    self.path
                 )));
             }
 
-            match self.try_read_entry(*offset, None).await {
+            match self.try_read_entry(offset, None).await {
                 Ok(entry) => entries.push(entry),
                 Err(e) => {
                     return Err(LsmError::Internal(format!(
                         "Failed to read key '{}' at offset {} in {:?}: {}",
-                        key, offset, self.path, e
+                        String::from_utf8_lossy(key),
+                        offset,
+                        self.path,
+                        e
                     )));
                 }
             }
