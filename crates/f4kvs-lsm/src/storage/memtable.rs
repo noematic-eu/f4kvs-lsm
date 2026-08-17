@@ -122,6 +122,16 @@ impl Memtable {
         }
     }
 
+    /// Non-blocking lookup. `None` if a writer holds the lock.
+    pub fn lookup_sync(&self, key: &str) -> Option<MemtableLookupResult> {
+        let data = self.data.try_read().ok()?;
+        Some(match data.get(key) {
+            Some(Value::Null) => MemtableLookupResult::Tombstone,
+            Some(value) => MemtableLookupResult::Found(value.clone()),
+            None => MemtableLookupResult::Missing,
+        })
+    }
+
     /// Get a value by key
     pub async fn get(&self, key: &str) -> Result<Option<Value>> {
         let data = self.data.read().await;

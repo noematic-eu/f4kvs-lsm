@@ -314,8 +314,10 @@ impl CompactionManager {
                 match timeout(lock_timeout, sstables.write()).await {
                     Ok(guard) => guard,
                     Err(_) => {
-                        warn!("Could not acquire lock to update SSTables after compaction, compaction results will be lost");
-                        return Ok(()); // Skip update if we can't get the lock
+                        // compact_level no longer unlinks inputs before install.
+                        // Leave the in-memory index on the original files.
+                        warn!("Could not acquire lock to update SSTables after compaction; keeping inputs");
+                        return Ok(());
                     }
                 }
             }
@@ -335,9 +337,18 @@ impl CompactionManager {
 
         let mut merged = new_sstables;
         merged.extend(concurrent);
+        let kept: std::collections::HashSet<_> =
+            merged.iter().map(|s| s.path().clone()).collect();
+        let to_reclaim: Vec<SSTable> = all_sstables
+            .get(&level)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !kept.contains(s.path()))
+            .collect();
         sstables_guard.insert(level, merged);
-
-        // Lock is released here, allowing reads to proceed immediately
+        drop(sstables_guard);
+        self.reclaim_compacted_inputs(&to_reclaim).await;
 
         Ok(())
     }
@@ -543,19 +554,16 @@ impl CompactionManager {
 
             let entries = self.read_sstable_entries_safe(sstable).await;
             // Distinguish truly empty SSTables (entry_count == 0) from read
-            // failures. Treating a failed read as "empty" then deleting the
-            // input drops live keys permanently (soak crash-gate, 2026-08-11).
+            // failures. A non-empty partial read used to be treated as success,
+            // then reclaim_compacted_inputs unlinked the live file.
             let expected = sstable.metadata().entry_count;
-            if entries.is_empty() {
-                if expected == 0 {
-                    // Legitimately empty — skip.
-                    continue;
-                }
+            if entries.len() != expected {
                 warn!(
-                    "SSTable {:?} returned 0 entries but metadata.entry_count={} \
+                    "SSTable {:?} returned {} entries but metadata.entry_count={} \
                      (read failure / not-ready / truncated) — aborting compaction \
                      rather than dropping its keys",
                     sstable.path(),
+                    entries.len(),
                     expected
                 );
                 corrupted_sstables.push(sstable.path().to_path_buf());
@@ -852,9 +860,9 @@ impl CompactionManager {
             level, stats.entries_processed, stats.space_reclaimed
         );
 
-        // Outputs are already sync_all'd. Drop inputs from disk so restart
-        // does not reload thousands of obsolete L0 files (soak 203321Z).
-        self.reclaim_compacted_inputs(&sstables_to_compact).await;
+        // Do not unlink inputs here. Caller installs the new level first;
+        // reclaiming before that left Get pointing at deleted files when the
+        // install lock timed out.
 
         // Return remaining SSTables + new ones
         // Filter out SSTables that were compacted (marked for deletion)

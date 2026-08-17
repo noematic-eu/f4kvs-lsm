@@ -85,6 +85,77 @@ impl SstableFileReader {
         }
     }
 
+    /// Open a positioned `std::fs::File` without hopping to tokio.
+    pub fn ensure_open_blocking(&self, resilient: bool) -> Result<()> {
+        self.ensure_sync_open_blocking(resilient)
+    }
+
+    fn ensure_sync_open_blocking(&self, resilient: bool) -> Result<()> {
+        if self
+            .sync_file
+            .read()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if !resilient {
+            return Err(LsmError::Internal(
+                "Sync file not open and resilient handling is disabled".to_string(),
+            ));
+        }
+        let file = std::fs::File::open(&self.path).map_err(LsmError::Io)?;
+        let mut guard = self
+            .sync_file
+            .write()
+            .map_err(|e| LsmError::Internal(format!("sync file lock poisoned: {e}")))?;
+        if guard.is_none() {
+            *guard = Some(Arc::new(file));
+        }
+        Ok(())
+    }
+
+    /// `pread` into `buf` on the caller thread (Get / open hot path).
+    pub fn read_exact_at_blocking(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.ensure_open_blocking(true)?;
+        let file = self
+            .sync_file
+            .read()
+            .map_err(|e| LsmError::Internal(format!("sync file lock poisoned: {e}")))?
+            .clone()
+            .ok_or_else(|| LsmError::Internal("Sync file not open".to_string()))?;
+        let mut pos = 0usize;
+        let mut off = offset;
+        while pos < buf.len() {
+            let n = read_at_once(&file, off, &mut buf[pos..]).map_err(LsmError::Io)?;
+            if n == 0 {
+                return Err(LsmError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Unexpected EOF while reading {} bytes at offset {}",
+                        buf.len(),
+                        offset
+                    ),
+                )));
+            }
+            pos += n;
+            off += n as u64;
+        }
+        Ok(())
+    }
+
+    pub fn read_u32_le_at_blocking(&self, offset: u64) -> Result<u32> {
+        let mut buf = [0u8; 4];
+        self.read_exact_at_blocking(offset, &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    pub fn file_size_blocking(&self) -> Result<u64> {
+        std::fs::metadata(&self.path)
+            .map(|meta| meta.len())
+            .map_err(LsmError::Io)
+    }
+
     /// Close cached file handles.
     pub async fn close(&self) {
         {
@@ -137,14 +208,9 @@ impl SstableFileReader {
                     .map_err(|e| LsmError::Internal(format!("sync file lock poisoned: {e}")))?
                     .clone()
                     .ok_or_else(|| LsmError::Internal("Sync file not open".to_string()))?;
-                let len = buf.len();
-                let data = tokio::task::spawn_blocking(move || read_at_sync(&file, offset, len))
-                    .await
-                    .map_err(|e| LsmError::Internal(format!("spawn_blocking failed: {e}")))?
-                    .map_err(LsmError::Io)?;
-                let n = data.len().min(buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
-                Ok(n)
+                // pread is thread-safe. spawn_blocking on a few-KB Get dominates
+                // the syscall itself; do it inline on the caller thread.
+                read_at_once(&file, offset, buf).map_err(LsmError::Io)
             }
             SstableReadMode::MmapHybrid => {
                 let reader = self
@@ -291,37 +357,11 @@ fn effective_mode(mode: SstableReadMode) -> SstableReadMode {
     }
 }
 
-fn read_at_sync(file: &std::fs::File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    read_exact_at_sync(file, offset, &mut buf)?;
-    Ok(buf)
-}
-
 fn read_at_mmap(reader: &MmapHybridReader, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     let n = reader.read_at(offset, &mut buf)?;
     buf.truncate(n);
     Ok(buf)
-}
-
-fn read_exact_at_sync(file: &std::fs::File, mut offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    let mut pos = 0usize;
-    while pos < buf.len() {
-        let n = read_at_once(file, offset, &mut buf[pos..])?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "Unexpected EOF while reading {} bytes at offset {}",
-                    buf.len(),
-                    offset
-                ),
-            ));
-        }
-        pos += n;
-        offset += n as u64;
-    }
-    Ok(())
 }
 
 fn read_at_once(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {

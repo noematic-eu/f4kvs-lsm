@@ -156,8 +156,8 @@ pub struct LsmTreeEngine {
     /// Used to ensure correct ordering during compaction
     sequence_number: Arc<std::sync::atomic::AtomicU64>,
 
-    /// Operation guard to ensure compaction runs exclusively
-    /// Read operations acquire read lock, compaction acquires write lock
+    /// Serializes flush+WAL-truncate against put/delete. Compaction I/O does
+    /// not take the write side: SST pins + install lock protect readers.
     operation_guard: Arc<RwLock<()>>,
 
     /// Live key count (O(1) `count()`); rebuilt on open, maintained incrementally on writes/deletes.
@@ -166,8 +166,20 @@ pub struct LsmTreeEngine {
     /// Bulk import mode: skip per-key SSTable lookups when maintaining live key count.
     bulk_import: AtomicBool,
 
+    /// Per-get counters. The `stats` write lock used to serialize every Get.
+    read_total: AtomicU64,
+    read_memtable_hits: AtomicU64,
+    read_sstable_hits: AtomicU64,
+    read_misses: AtomicU64,
+
     /// Shared LRU cache for SSTable entry blocks (avoids repeated disk reads on hot keys).
     block_cache: SharedBlockCache,
+}
+
+enum GetKind {
+    Memtable,
+    Sstable,
+    Miss,
 }
 
 impl LsmTreeEngine {
@@ -255,11 +267,16 @@ impl LsmTreeEngine {
             operation_guard: Arc::new(RwLock::new(())),
             live_key_count: AtomicU64::new(0),
             bulk_import: AtomicBool::new(false),
+            read_total: AtomicU64::new(0),
+            read_memtable_hits: AtomicU64::new(0),
+            read_sstable_hits: AtomicU64::new(0),
+            read_misses: AtomicU64::new(0),
             block_cache,
         })
     }
 
-    /// Enable bulk import mode (vault tree load). Skips O(L0) SSTable probes per inserted key.
+    /// Enable bulk import mode (vault tree load). Skips O(L0) SSTable probes per
+    /// inserted key and defers compaction until the flag is cleared.
     pub fn set_bulk_import(&self, enabled: bool) {
         self.bulk_import.store(enabled, Ordering::Relaxed);
     }
@@ -276,6 +293,146 @@ impl LsmTreeEngine {
             self.live_key_count
                 .fetch_sub((-delta) as u64, Ordering::Relaxed);
         }
+    }
+
+    fn note_get(&self, kind: GetKind) {
+        self.read_total.fetch_add(1, Ordering::Relaxed);
+        match kind {
+            GetKind::Memtable => {
+                self.read_memtable_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            GetKind::Sstable => {
+                self.read_sstable_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            GetKind::Miss => {
+                self.read_misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn apply_read_stats(&self, stats: &mut LsmStats) {
+        stats.total_reads = self.read_total.load(Ordering::Relaxed);
+        stats.memtable_hits = self.read_memtable_hits.load(Ordering::Relaxed);
+        stats.sstable_hits = self.read_sstable_hits.load(Ordering::Relaxed);
+        stats.misses = self.read_misses.load(Ordering::Relaxed);
+    }
+
+    fn reset_read_stats(&self) {
+        self.read_total.store(0, Ordering::Relaxed);
+        self.read_memtable_hits.store(0, Ordering::Relaxed);
+        self.read_sstable_hits.store(0, Ordering::Relaxed);
+        self.read_misses.store(0, Ordering::Relaxed);
+    }
+
+    /// Synchronous Get for FFI. `None` = a write lock is held; caller should
+    /// fall back to the async `get`.
+    pub fn try_get_sync(
+        &self,
+        key: &str,
+    ) -> Option<std::result::Result<Option<Value>, F4KvsError>> {
+        let _op = self.operation_guard.try_read().ok()?;
+        match self.get_from_memtables_sync(key)? {
+            MemtableLookupResult::Found(value) => {
+                self.note_get(GetKind::Memtable);
+                return Some(Ok(Some(value)));
+            }
+            MemtableLookupResult::Tombstone => {
+                self.note_get(GetKind::Memtable);
+                return Some(Ok(None));
+            }
+            MemtableLookupResult::Missing => {}
+        }
+        match self.get_from_sstables_sync(key) {
+            Some(Ok(Some(value))) => {
+                self.note_get(GetKind::Sstable);
+                Some(Ok(Some(value)))
+            }
+            Some(Ok(None)) => {
+                self.note_get(GetKind::Miss);
+                Some(Ok(None))
+            }
+            Some(Err(e)) => Some(Err(Self::convert_error(e))),
+            None => None,
+        }
+    }
+
+    fn get_from_memtables_sync(&self, key: &str) -> Option<MemtableLookupResult> {
+        {
+            let memtable = self.active_memtable.try_read().ok()?;
+            match memtable.lookup_sync(key)? {
+                MemtableLookupResult::Missing => {}
+                other => return Some(other),
+            }
+        }
+        let immutable = self.immutable_memtables.try_read().ok()?;
+        for memtable in immutable.iter() {
+            match memtable.lookup_sync(key)? {
+                MemtableLookupResult::Missing => {}
+                other => return Some(other),
+            }
+        }
+        Some(MemtableLookupResult::Missing)
+    }
+
+    fn get_from_sstables_sync(&self, key: &str) -> Option<Result<Option<Value>>> {
+        use crate::storage::sstable::SstableLookupResult;
+        let sstables = self.sstables.try_read().ok()?;
+        for level in 0..self.config.levels.count {
+            let Some(level_sstables) = sstables.get(&level) else {
+                continue;
+            };
+            let candidates: Vec<usize> = if level == 0 {
+                (0..level_sstables.len())
+                    .filter(|&idx| level_sstables[idx].key_may_exist(key))
+                    .collect()
+            } else {
+                Self::find_sstable_for_key(level_sstables, key)
+                    .filter(|&idx| level_sstables[idx].key_may_exist(key))
+                    .into_iter()
+                    .collect()
+            };
+            let mut best_ts: u64 = 0;
+            let mut best: Option<SstableLookupResult> = None;
+            for idx in candidates {
+                let sstable = &level_sstables[idx];
+                sstable.pin_reader();
+                let hit = sstable.lookup_sync(key);
+                sstable.unpin_reader();
+                match hit {
+                    Ok(SstableLookupResult::Missing) => {}
+                    Ok(hit) => {
+                        let ts = match &hit {
+                            SstableLookupResult::Found { timestamp, .. } => *timestamp,
+                            SstableLookupResult::Tombstone { timestamp } => *timestamp,
+                            SstableLookupResult::Missing => 0,
+                        };
+                        if level == 0 {
+                            if ts >= best_ts {
+                                best_ts = ts;
+                                best = Some(hit);
+                            }
+                        } else {
+                            return Some(Ok(match hit {
+                                SstableLookupResult::Found { value, .. } => Some(value),
+                                SstableLookupResult::Tombstone { .. } => None,
+                                SstableLookupResult::Missing => None,
+                            }));
+                        }
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            if level == 0 {
+                if let Some(hit) = best {
+                    return Some(Ok(match hit {
+                        SstableLookupResult::Found { value, .. } => Some(value),
+                        SstableLookupResult::Tombstone { .. } => None,
+                        SstableLookupResult::Missing => None,
+                    }));
+                }
+            }
+        }
+        Some(Ok(None))
     }
 
     /// Rebuild live key count from SSTable metadata + memtables (startup).
@@ -456,7 +613,6 @@ impl LsmTreeEngine {
 
         log::debug!("Data directory exists: {:?}", data_dir);
 
-        let mut sstables = self.sstables.write().await;
         let mut loaded_count = 0;
         // Highest flush-path sequence seen on disk. After load we advance
         // `sequence_number` past this so new L0_{seq}.sst names never collide
@@ -466,74 +622,61 @@ impl LsmTreeEngine {
         // Scan for SSTable files. Two historical naming schemes coexist:
         //   1. Flush path:   L{level}_{hex_seq}.sst          (e.g. L0_0000000000006ddd.sst)
         //   2. Compaction:   sstable_l{level}_t{unix_ts}.sst (e.g. sstable_l0_t1785744634.sst)
-        // Recovery used to only accept (1), so compacted files were invisible after restart —
-        // observed on the full-tier soak gate: anchors lived only in sstable_l0_t* and
-        // returned 404 post-restart despite being on disk (see f4kvs-v2 soak-20260803T080810Z).
         let mut failed_count = 0usize;
         let mut candidate_count = 0usize;
+        let mut jobs: Vec<(std::path::PathBuf, usize, String)> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                    log::trace!("Found file: {}", file_name);
-                    if let Some(seq) = parse_sstable_flush_sequence_from_filename(file_name) {
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned)
+                {
+                    if let Some(seq) = parse_sstable_flush_sequence_from_filename(&file_name) {
                         max_flush_seq = max_flush_seq.max(seq);
                     }
-                    let level = match parse_sstable_level_from_filename(file_name) {
-                        Some(level) => level,
-                        None => continue,
+                    let Some(level) = parse_sstable_level_from_filename(&file_name) else {
+                        continue;
                     };
                     candidate_count += 1;
-                    log::trace!("Processing SSTable file: {} (level {})", file_name, level);
-                    match SSTable::new(path.clone(), self.config.sstable.clone(), level) {
-                        Ok(mut sstable) => {
-                            // Open → load index/metadata into memory → release FD.
-                            // Holding every handle open hits the process soft limit
-                            // (~8192 on macOS): ~8177 loaded, rest silently skipped
-                            // (comfort crash-loop 2026-08-12, Bug 3).
-                            let open_result = sstable.open().await;
-                            let open_result = match open_result {
-                                Ok(()) => Ok(()),
-                                Err(e) if Self::is_fd_exhaustion(&e) => {
-                                    // Defensive: close any still-open handles and retry once.
-                                    warn!(
-                                        "FD exhaustion opening {}: {}; closing open handles and retrying",
-                                        file_name, e
-                                    );
-                                    for level_sstables in sstables.values_mut() {
-                                        for s in level_sstables.iter_mut() {
-                                            s.close_file_handle().await;
-                                        }
-                                    }
-                                    sstable.open().await
-                                }
-                                Err(e) => Err(e),
-                            };
-                            match open_result {
-                                Ok(()) => {
-                                    // Keep is_ready + index; drop OS FD for capacity.
-                                    sstable.close_file_handle().await;
-                                    let level_sstables =
-                                        sstables.entry(level).or_insert_with(Vec::new);
-                                    level_sstables.push(sstable);
-                                    loaded_count += 1;
-                                    info!("Loaded SSTable: {} (level {})", file_name, level);
-                                }
-                                Err(e) => {
-                                    failed_count += 1;
-                                    warn!(
-                                        "Failed to open SSTable {} (level {}): {}",
-                                        file_name, level, e
-                                    );
-                                }
+                    jobs.push((path, level, file_name));
+                }
+            }
+        }
+
+        let sst_cfg = self.config.sstable.clone();
+        let opened: Vec<(usize, Result<SSTable>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .into_iter()
+                .map(|(path, level, name)| {
+                    let cfg = sst_cfg.clone();
+                    scope.spawn(move || {
+                        let mut sstable = match SSTable::new(path, cfg, level) {
+                            Ok(s) => s,
+                            Err(e) => return (level, Err(e)),
+                        };
+                        match sstable.open_sync() {
+                            Ok(()) => (level, Ok(sstable)),
+                            Err(e) => {
+                                warn!("Failed to open SSTable {} (level {}): {}", name, level, e);
+                                (level, Err(e))
                             }
                         }
-                        Err(e) => {
-                            failed_count += 1;
-                            warn!("Failed to create SSTable for {}: {}", file_name, e);
-                        }
-                    }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("sstable open thread"))
+                .collect()
+        });
+
+        let mut sstables = self.sstables.write().await;
+        for (level, result) in opened {
+            match result {
+                Ok(sstable) => {
+                    sstables.entry(level).or_insert_with(Vec::new).push(sstable);
+                    loaded_count += 1;
                 }
+                Err(_) => failed_count += 1,
             }
         }
 
@@ -546,6 +689,16 @@ impl LsmTreeEngine {
             );
         }
 
+        // Small shards (typical catalog L0) keep FDs so Get does not reopen.
+        // Huge shards still drop handles to stay under ulimit.
+        if loaded_count > self.config.sstable.max_open_files {
+            for level_sstables in sstables.values() {
+                for sstable in level_sstables {
+                    sstable.close_file_handle().await;
+                }
+            }
+        }
+
         // sequence_number is shared for L0 filenames AND entry timestamps.
         // A flush of N entries consumes N+1 sequence numbers (1 filename + N
         // timestamps). Resuming only past max *filename* seq leaves the counter
@@ -554,25 +707,18 @@ impl LsmTreeEngine {
         //   - flush-path filename sequences
         //   - entry timestamps inside loaded SSTables
         //   - durable SEQUENCE file (survives if a crash skips a scan path)
+        // A flush of N entries uses filename seq S then timestamps S+1..S+N.
+        // Do not call get_all_entries() here — that rereads every value on
+        // every open (42s on a 2M-key catalog shard).
         let mut max_entry_ts: u64 = 0;
         for level_sstables in sstables.values() {
             for sstable in level_sstables {
-                match sstable.get_all_entries().await {
-                    Ok(entries) => {
-                        for e in entries {
-                            max_entry_ts = max_entry_ts.max(e.timestamp);
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            "Could not scan timestamps in {:?}: {} (using SEQUENCE file fallback)",
-                            sstable.path(),
-                            err
-                        );
+                if let Some(name) = sstable.path().file_name().and_then(|n| n.to_str()) {
+                    if let Some(seq) = parse_sstable_flush_sequence_from_filename(name) {
+                        let n = sstable.metadata().entry_count as u64;
+                        max_entry_ts = max_entry_ts.max(seq.saturating_add(n));
                     }
                 }
-                // Release FD after scan so N SSTables do not accumulate open handles.
-                sstable.close_file_handle().await;
             }
         }
         let seq_file_hw = self.load_sequence_file().await.unwrap_or(0);
@@ -676,18 +822,10 @@ impl LsmTreeEngine {
             return Ok(());
         }
 
-        // Check if WAL directory has any files
         let mut has_files = false;
-        let mut file_count = 0;
         if let Ok(entries) = std::fs::read_dir(wal_dir) {
-            for entry in entries.flatten() {
-                file_count += 1;
-                has_files = true;
-                info!("Found WAL file: {:?}", entry.path());
-            }
+            has_files = entries.flatten().next().is_some();
         }
-
-        info!("WAL directory has {} files", file_count);
 
         if !has_files {
             info!("WAL directory is empty, skipping recovery");
@@ -1163,8 +1301,12 @@ impl LsmTreeEngine {
         }
         // Compact after dropping the read guard — L0 merge does not need
         // exclusive access, and holding the guard starved it (see soak 165114Z).
-        if let Err(e) = self.compact_if_needed().await {
-            warn!("Post-flush compaction failed: {}", e);
+        // Bulk ingest must not compact: a large shard crosses the default
+        // L0 trigger and a partial merge used to unlink live inputs.
+        if !self.bulk_import.load(Ordering::Relaxed) {
+            if let Err(e) = self.compact_if_needed().await {
+                warn!("Post-flush compaction failed: {}", e);
+            }
         }
         Ok(())
     }
@@ -1445,58 +1587,26 @@ impl LsmTreeEngine {
         Ok(())
     }
 
-    /// Get value from memtables (fast path, single lock per memtable)
-    async fn get_from_memtables(&self, key: &str) -> Result<Option<Value>> {
+    /// Get value from memtables (fast path, single lock per memtable).
+    /// Tombstone and miss are distinct so Get does not walk memtables twice.
+    async fn get_from_memtables(&self, key: &str) -> Result<MemtableLookupResult> {
         {
             let memtable = self.active_memtable.read().await;
             match memtable.lookup(key).await? {
-                MemtableLookupResult::Found(value) => {
-                    debug!("Found key '{}' in active memtable", key);
-                    return Ok(Some(value));
-                }
-                MemtableLookupResult::Tombstone => {
-                    debug!("Key '{}' tombstoned in active memtable", key);
-                    return Ok(None);
-                }
                 MemtableLookupResult::Missing => {}
-            }
-        }
-
-        let immutable = self.immutable_memtables.read().await;
-        for (i, memtable) in immutable.iter().enumerate() {
-            match memtable.lookup(key).await? {
-                MemtableLookupResult::Found(value) => {
-                    debug!("Found key '{}' in immutable memtable {}", key, i);
-                    return Ok(Some(value));
-                }
-                MemtableLookupResult::Tombstone => {
-                    debug!("Key '{}' tombstoned in immutable memtable {}", key, i);
-                    return Ok(None);
-                }
-                MemtableLookupResult::Missing => {}
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Check if a key has a tombstone in any memtable
-    async fn has_tombstone_in_memtables(&self, key: &str) -> Result<bool> {
-        {
-            let memtable = self.active_memtable.read().await;
-            if matches!(memtable.lookup(key).await?, MemtableLookupResult::Tombstone) {
-                return Ok(true);
+                other => return Ok(other),
             }
         }
 
         let immutable = self.immutable_memtables.read().await;
         for memtable in immutable.iter() {
-            if matches!(memtable.lookup(key).await?, MemtableLookupResult::Tombstone) {
-                return Ok(true);
+            match memtable.lookup(key).await? {
+                MemtableLookupResult::Missing => {}
+                other => return Ok(other),
             }
         }
 
-        Ok(false)
+        Ok(MemtableLookupResult::Missing)
     }
 
     /// Apply one storage layer onto a merged scan map (newer layers call this later).
@@ -1526,22 +1636,35 @@ impl LsmTreeEngine {
     }
 
     /// Pin an SSTable for reading so LRU eviction cannot close its file handle.
-    async fn pin_sstable_reader(&self, level: usize, idx: usize) -> Option<SstableReadPin> {
+    /// Returns `(pin, already_open)` so Get can skip the capacity/reopen path.
+    async fn pin_sstable_reader(&self, level: usize, idx: usize) -> Option<(SstableReadPin, bool)> {
         let sstables = self.sstables.read().await;
         let sstable = sstables.get(&level)?.get(idx)?;
         sstable.pin_reader();
-        Some(SstableReadPin {
-            sstables: Arc::clone(&self.sstables),
-            level,
-            idx,
-        })
+        let already_open = sstable.is_open();
+        Some((
+            SstableReadPin {
+                sstables: Arc::clone(&self.sstables),
+                level,
+                idx,
+            },
+            already_open,
+        ))
     }
 
     /// Open an SSTable file if needed.
     ///
     /// Caller must hold an [`SstableReadPin`] so LRU eviction cannot close the file
-    /// between opening and reading.
+    /// between opening and reading. No-op when the FD is already cached.
     async fn ensure_sstable_open(&self, level: usize, idx: usize) {
+        {
+            let sstables = self.sstables.read().await;
+            match sstables.get(&level).and_then(|level_sstables| level_sstables.get(idx)) {
+                Some(sstable) if sstable.is_open() => return,
+                None => return,
+                Some(_) => {}
+            }
+        }
         if let Err(e) = self.ensure_file_handle_capacity().await {
             warn!(
                 "ensure_file_handle_capacity failed before open L{}[{}]: {}",
@@ -1565,6 +1688,7 @@ impl LsmTreeEngine {
     }
 
     /// True when an I/O error is process FD exhaustion (EMFILE/ENFILE).
+    #[allow(dead_code)]
     fn is_fd_exhaustion(err: &LsmError) -> bool {
         match err {
             LsmError::Io(io_err) => {
@@ -1682,10 +1806,13 @@ impl LsmTreeEngine {
             let mut best: Option<SstableLookupResult> = None;
 
             for idx in candidate_indices {
-                let Some(_read_pin) = self.pin_sstable_reader(level, idx).await else {
+                let Some((_read_pin, already_open)) = self.pin_sstable_reader(level, idx).await
+                else {
                     continue;
                 };
-                self.ensure_sstable_open(level, idx).await;
+                if !already_open {
+                    self.ensure_sstable_open(level, idx).await;
+                }
                 let sstables = self.sstables.read().await;
                 let Some(sstable) = sstables
                     .get(&level)
@@ -1888,7 +2015,8 @@ impl StorageEngine for LsmTreeEngine {
     }
 
     async fn get(&self, key: &str) -> std::result::Result<Option<Value>, F4KvsError> {
-        // Acquire read lock to prevent compaction during read
+        // Shared lock: flush+WAL-truncate takes the exclusive side. Compaction
+        // I/O no longer does, so Gets are not stalled by a merge.
         let _op_guard = self.operation_guard.read().await;
 
         log::trace!("=== GET OPERATION DEBUG ===");
@@ -1905,46 +2033,24 @@ impl StorageEngine for LsmTreeEngine {
             }
         }
 
-        // Try memtables first (fast path)
-        log::trace!("Checking memtables for key '{}'", key);
         match self
             .get_from_memtables(key)
             .await
             .map_err(Self::convert_error)?
         {
-            Some(value) => {
+            MemtableLookupResult::Found(value) => {
                 log::trace!("Found key '{}' in memtables: {:?}", key, value);
-                // Update statistics
-                {
-                    let mut stats = self.stats.write().await;
-                    stats.total_reads += 1;
-                    stats.memtable_hits += 1;
-                }
+                self.note_get(GetKind::Memtable);
                 return Ok(Some(value));
             }
-            None => {
-                log::trace!("Key '{}' not found in memtables", key);
-                // Check if key was deleted (tombstone exists in memtables)
-                // If so, return None immediately without checking SSTables
-                if self
-                    .has_tombstone_in_memtables(key)
-                    .await
-                    .map_err(Self::convert_error)?
-                {
-                    log::trace!("Key '{}' has tombstone in memtables, returning None", key);
-                    // Update statistics
-                    {
-                        let mut stats = self.stats.write().await;
-                        stats.total_reads += 1;
-                        stats.memtable_hits += 1;
-                    }
-                    return Ok(None);
-                }
-                // Key not found in memtables, continue to SSTables
+            MemtableLookupResult::Tombstone => {
+                log::trace!("Key '{}' has tombstone in memtables, returning None", key);
+                self.note_get(GetKind::Memtable);
+                return Ok(None);
             }
+            MemtableLookupResult::Missing => {}
         }
 
-        // Try SSTables (slow path)
         log::trace!("Checking SSTables for key '{}'", key);
         if let Some(value) = self
             .get_from_sstables(key)
@@ -1952,23 +2058,12 @@ impl StorageEngine for LsmTreeEngine {
             .map_err(Self::convert_error)?
         {
             log::trace!("Found key '{}' in SSTables: {:?}", key, value);
-            // Update statistics
-            {
-                let mut stats = self.stats.write().await;
-                stats.total_reads += 1;
-                stats.sstable_hits += 1;
-            }
+            self.note_get(GetKind::Sstable);
             return Ok(Some(value));
         }
 
         log::trace!("Key '{}' not found anywhere", key);
-        // Key not found
-        {
-            let mut stats = self.stats.write().await;
-            stats.total_reads += 1;
-            stats.misses += 1;
-        }
-
+        self.note_get(GetKind::Miss);
         Ok(None)
     }
 
@@ -2031,16 +2126,9 @@ impl StorageEngine for LsmTreeEngine {
             .await
             .map_err(Self::convert_error)?
         {
-            Some(_) => return Ok(true),
-            None => {
-                if self
-                    .has_tombstone_in_memtables(key)
-                    .await
-                    .map_err(Self::convert_error)?
-                {
-                    return Ok(false);
-                }
-            }
+            MemtableLookupResult::Found(_) => return Ok(true),
+            MemtableLookupResult::Tombstone => return Ok(false),
+            MemtableLookupResult::Missing => {}
         }
 
         // Check SSTables (get_from_sstables already honours L0 tombstones)
@@ -2410,20 +2498,18 @@ impl StorageEngine for LsmTreeEngine {
     }
 
     async fn compact(&self) -> std::result::Result<(), F4KvsError> {
-        info!("Starting manual compaction - waiting for exclusive access");
+        info!("Starting manual compaction");
 
-        // Acquire WRITE lock to ensure exclusive access during compaction
-        // This blocks all reads/writes until compaction completes
-        let _op_guard = self.operation_guard.write().await;
+        // Flush under exclusive lock (WAL truncate must not race put/delete).
+        // Drop it before merge I/O so Gets stay concurrent; SST pins keep
+        // input FDs alive until reclaim_compacted_inputs waits out readers.
+        {
+            let _op_guard = self.operation_guard.write().await;
+            self.flush_memtable_internal()
+                .await
+                .map_err(Self::convert_error)?;
+        }
 
-        info!("Acquired exclusive lock for compaction");
-
-        // Flush any pending memtables first (no need to acquire read lock, we have write lock)
-        self.flush_memtable_internal()
-            .await
-            .map_err(Self::convert_error)?;
-
-        // Run compaction
         self.compaction_manager
             .compact_all(&self.sstables)
             .await
@@ -3226,8 +3312,10 @@ impl StorageEngine for LsmTreeEngine {
 
         // Buffer-pool soak flushes hold the exclusive guard; compact only after
         // release so L0 can drain without blocking the write path.
-        if let Err(e) = self.compact_if_needed().await {
-            warn!("Post-flush compaction failed: {}", e);
+        if !self.bulk_import.load(Ordering::Relaxed) {
+            if let Err(e) = self.compact_if_needed().await {
+                warn!("Post-flush compaction failed: {}", e);
+            }
         }
         Ok(())
     }
@@ -3297,8 +3385,9 @@ impl LsmTreeEngine {
 
     /// Get LSM-specific statistics
     pub async fn lsm_stats(&self) -> Result<LsmStats> {
-        let stats = self.stats.read().await;
-        Ok(stats.clone())
+        let mut stats = self.stats.read().await.clone();
+        self.apply_read_stats(&mut stats);
+        Ok(stats)
     }
 
     /// Get engine configuration
@@ -3483,25 +3572,20 @@ impl LsmTreeEngine {
 
     /// Run compaction on all levels
     ///
-    /// This method acquires exclusive access to prevent concurrent operations
-    /// and flushes memtables before compaction.
+    /// Flush takes exclusive `operation_guard` briefly (WAL truncate). The
+    /// merge itself runs without that lock so Gets stay concurrent.
     pub async fn compact_all(&self) -> Result<()> {
-        // Try to acquire write lock with timeout to avoid blocking indefinitely
         let lock_timeout = Duration::from_secs(5);
-        let _op_guard = match tokio::time::timeout(lock_timeout, self.operation_guard.write()).await
-        {
-            Ok(guard) => guard,
+        match tokio::time::timeout(lock_timeout, self.operation_guard.write()).await {
+            Ok(_guard) => {
+                self.flush_memtable_internal().await?;
+            }
             Err(_) => {
-                // If we can't get the lock quickly, skip compaction this time
-                debug!("Skipping compact_all - could not acquire lock within timeout");
+                debug!("Skipping compact_all flush - could not acquire lock within timeout");
                 return Ok(());
             }
-        };
+        }
 
-        // Use internal flush since we already hold the operation guard
-        self.flush_memtable_internal().await?;
-
-        // Run compaction on all levels
         self.compaction_manager.compact_all(&self.sstables).await
     }
 
@@ -3693,6 +3777,7 @@ impl LsmTreeEngine {
         {
             let mut stats = self.stats.write().await;
             *stats = LsmStats::default();
+            self.reset_read_stats();
             info!("Reset statistics during recovery");
         }
 
@@ -3733,13 +3818,13 @@ impl LsmTreeEngine {
         }
 
         PerformanceMetrics {
-            total_operations: stats.total_operations(),
-            read_operations: stats.total_reads,
+            total_operations: stats.total_operations() + self.read_total.load(Ordering::Relaxed),
+            read_operations: self.read_total.load(Ordering::Relaxed),
             write_operations: stats.total_writes,
             delete_operations: stats.total_deletes,
             total_sstables,
             total_size_bytes: total_size,
-            memtable_entries: stats.memtable_hits,
+            memtable_entries: self.read_memtable_hits.load(Ordering::Relaxed),
             immutable_memtables: 0, // Not tracked in current stats
             level_metrics: level_stats,
             avg_read_latency_ms: 0.0,  // Not tracked in current stats
@@ -5476,7 +5561,10 @@ mod tests {
                 max_open_files: 16, // force LRU pressure after reopen
                 ..Default::default()
             },
-            levels: LevelConfig::default(),
+            levels: LevelConfig {
+                max_sstables_per_level: 1_000_000, // do not merge the 80 L0 files
+                ..Default::default()
+            },
             compaction: CompactionConfig {
                 background_enabled: false, // keep L0 files, no merge-away
                 ..Default::default()
@@ -5496,6 +5584,7 @@ mod tests {
             let engine = LsmTreeEngine::new(config.clone())
                 .await
                 .expect("engine session1");
+            engine.set_bulk_import(true); // skip post-flush compact
             for i in 0..n_files {
                 engine
                     .put(&format!("k{i:04}"), &Value::String(format!("v{i}")))
@@ -5549,6 +5638,88 @@ mod tests {
         // Point lookups still work (lazy re-open).
         for i in 0..n_files {
             let got = engine.get(&format!("k{i:04}")).await.expect("get");
+            assert_eq!(got, Some(Value::String(format!("v{i}"))));
+        }
+    }
+
+    /// Small shards keep SST FDs open so Get does not reopen.
+    #[tokio::test]
+    async fn load_existing_sstables_keeps_fds_when_under_limit() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            memtable: MemtableConfig {
+                max_size: 512,
+                max_immutable_count: 2,
+                flush_threshold: 0.5,
+                use_skip_list: true,
+                concurrent_reads: true,
+            },
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            sstable: SstableConfig {
+                target_size: 1024,
+                max_size: 64 * 1024,
+                max_open_files: 32,
+                ..Default::default()
+            },
+            levels: LevelConfig {
+                max_sstables_per_level: 1_000_000,
+                ..Default::default()
+            },
+            compaction: CompactionConfig {
+                background_enabled: false,
+                ..Default::default()
+            },
+            bloom_filter: BloomFilterConfig::default(),
+            column_families: ColumnFamilyConfig {
+                default_name: "default".to_string(),
+                enable_isolation: false,
+                max_count: 100,
+            },
+            performance: PerformanceConfig::default(),
+            adaptive_compaction: None,
+        };
+
+        {
+            let engine = LsmTreeEngine::new(config.clone())
+                .await
+                .expect("engine session1");
+            engine.set_bulk_import(true);
+            for i in 0..4 {
+                engine
+                    .put(&format!("k{i}"), &Value::String(format!("v{i}")))
+                    .await
+                    .expect("put");
+                engine.flush().await.expect("flush");
+            }
+        }
+
+        let engine = LsmTreeEngine::new(config).await.expect("reopen");
+        let sstables = engine.sstables.read().await;
+        let mut loaded = 0usize;
+        let mut still_open = 0usize;
+        for level_sstables in sstables.values() {
+            for s in level_sstables {
+                loaded += 1;
+                if s.is_open() {
+                    still_open += 1;
+                }
+            }
+        }
+        drop(sstables);
+        assert!(loaded >= 4, "expected the 4 flushed L0 files, got {loaded}");
+        assert_eq!(
+            still_open, loaded,
+            "small shard must keep SST FDs open (open={still_open} loaded={loaded})"
+        );
+        for i in 0..4 {
+            let got = engine.get(&format!("k{i}")).await.expect("get");
             assert_eq!(got, Some(Value::String(format!("v{i}"))));
         }
     }

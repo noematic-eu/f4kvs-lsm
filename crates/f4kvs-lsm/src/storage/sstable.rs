@@ -655,23 +655,21 @@ impl SSTable {
 
     /// Open SSTable for reading
     pub async fn open(&mut self) -> Result<()> {
-        // Update last access time
-        self.update_last_access();
+        self.open_sync()
+    }
 
-        if self.reader.is_open() {
+    /// Load metadata + index with blocking I/O (no tokio hop).
+    pub fn open_sync(&mut self) -> Result<()> {
+        self.update_last_access();
+        if self.is_ready.load(std::sync::atomic::Ordering::Acquire)
+            && !self.index.is_empty()
+        {
             return Ok(());
         }
-
-        self.reader.ensure_open(true).await?;
-
-        // Read metadata and index
-        self.read_metadata_and_index().await?;
-
-        // Mark SSTable as ready only after metadata and index are fully loaded
-        // This ensures reads can safely access the index and metadata
+        self.reader.ensure_open_blocking(true)?;
+        self.try_read_metadata_and_index_blocking()?;
         self.is_ready
             .store(true, std::sync::atomic::Ordering::Release);
-
         Ok(())
     }
 
@@ -696,10 +694,13 @@ impl SSTable {
     /// memory) so opening N >> ulimit SSTables succeeds. Re-open on read is the
     /// normal path — log at debug, not warn (was drowning logs at ~300k/run).
     pub async fn ensure_file_open(&self) -> Result<()> {
+        self.ensure_file_open_sync()
+    }
+
+    pub fn ensure_file_open_sync(&self) -> Result<()> {
         if !self.reader.is_open() {
             if self.config.enable_resilient_handling {
-                tracing::debug!("Re-opening closed SSTable file: {:?}", self.path);
-                self.reader.ensure_open(true).await?;
+                self.reader.ensure_open_blocking(true)?;
                 self.update_last_access();
             } else {
                 return Err(LsmError::Internal(
@@ -712,41 +713,10 @@ impl SSTable {
         Ok(())
     }
 
-    /// Read metadata and index from file with retry logic
-    async fn read_metadata_and_index(&mut self) -> Result<()> {
-        let mut attempts = 0;
-        let max_attempts = self.config.file_retry_attempts;
-        let retry_delay = Duration::from_millis(self.config.retry_delay_ms);
+    fn try_read_metadata_and_index_blocking(&mut self) -> Result<()> {
+        self.reader.ensure_open_blocking(true)?;
 
-        loop {
-            match self.try_read_metadata_and_index().await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= max_attempts {
-                        return Err(e);
-                    }
-
-                    error!("Failed to read metadata and index (attempt {attempts}): {e}");
-
-                    // Try to re-open the file
-                    if let Err(reopen_err) = self.ensure_file_open().await {
-                        error!("Failed to re-open file: {reopen_err}");
-                        return Err(reopen_err);
-                    }
-
-                    // Wait before retry
-                    sleep(retry_delay).await;
-                }
-            }
-        }
-    }
-
-    /// Try to read metadata and index from file
-    async fn try_read_metadata_and_index(&mut self) -> Result<()> {
-        self.ensure_file_open().await?;
-
-        let file_size = self.reader.file_size().await?;
+        let file_size = self.reader.file_size_blocking()?;
 
         // Read metadata from end of file (metadata is at the end, followed by its checksum)
         let mut buffer = vec![0u8; 2048];
@@ -758,7 +728,9 @@ impl SSTable {
             let read_size = std::cmp::min(pos, buffer.len() as u64) as usize;
             pos -= read_size as u64;
 
-            let bytes_read = self.reader.read_at(pos, &mut buffer[..read_size]).await?;
+            self.reader
+                .read_exact_at_blocking(pos, &mut buffer[..read_size])?;
+            let bytes_read = read_size;
 
             for i in (0..bytes_read.saturating_sub(4)).rev() {
                 if let Ok(metadata) =
@@ -777,12 +749,13 @@ impl SSTable {
         }
 
         let metadata_checksum_offset = metadata_offset + metadata_size as u64;
-        let stored_metadata_checksum = self.reader.read_u32_le_at(metadata_checksum_offset).await?;
+        let stored_metadata_checksum = self
+            .reader
+            .read_u32_le_at_blocking(metadata_checksum_offset)?;
 
         let mut metadata_buffer = vec![0u8; metadata_size];
         self.reader
-            .read_exact_at(metadata_offset, &mut metadata_buffer)
-            .await?;
+            .read_exact_at_blocking(metadata_offset, &mut metadata_buffer)?;
 
         let mut metadata_hasher = Crc32Hasher::new();
         metadata_hasher.update(&metadata_buffer);
@@ -801,10 +774,11 @@ impl SSTable {
 
         let mut index_buffer = vec![0u8; index_size as usize];
         self.reader
-            .read_exact_at(index_start, &mut index_buffer)
-            .await?;
+            .read_exact_at_blocking(index_start, &mut index_buffer)?;
 
-        let stored_index_checksum = self.reader.read_u32_le_at(index_start + index_size).await?;
+        let stored_index_checksum = self
+            .reader
+            .read_u32_le_at_blocking(index_start + index_size)?;
 
         let mut index_hasher = Crc32Hasher::new();
         index_hasher.update(&index_buffer);
@@ -827,13 +801,11 @@ impl SSTable {
         if bloom_filter_size > 0 {
             let mut bloom_filter_buffer = vec![0u8; bloom_filter_size as usize];
             self.reader
-                .read_exact_at(bloom_filter_start, &mut bloom_filter_buffer)
-                .await?;
+                .read_exact_at_blocking(bloom_filter_start, &mut bloom_filter_buffer)?;
 
             let stored_bloom_checksum = self
                 .reader
-                .read_u32_le_at(bloom_filter_start + bloom_filter_size)
-                .await?;
+                .read_u32_le_at_blocking(bloom_filter_start + bloom_filter_size)?;
 
             // Validate bloom filter checksum
             let mut bloom_hasher = Crc32Hasher::new();
@@ -932,6 +904,80 @@ impl SSTable {
             SstableLookupResult::Found { value, .. } => Ok(Some(value)),
             SstableLookupResult::Tombstone { .. } | SstableLookupResult::Missing => Ok(None),
         }
+    }
+
+    /// Synchronous lookup (no tokio). File must be open or resilient reopen is on.
+    pub(crate) fn lookup_sync(&self, key: &str) -> Result<SstableLookupResult> {
+        if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LsmError::Internal(format!(
+                "Cannot read from SSTable that is not ready: {:?}",
+                self.path
+            )));
+        }
+        if !self.key_may_exist(key) {
+            return Ok(SstableLookupResult::Missing);
+        }
+        self.update_last_access();
+        let Some(&(offset, size)) = self.index.get(key) else {
+            return Ok(SstableLookupResult::Missing);
+        };
+        if self.metadata.index_offset == 0
+            || offset >= self.metadata.index_offset
+            || size == 0
+            || size > 100 * 1024 * 1024
+        {
+            return Ok(SstableLookupResult::Missing);
+        }
+        match self.try_read_entry_sync(offset) {
+            Ok(entry) if entry.deleted => Ok(SstableLookupResult::Tombstone {
+                timestamp: entry.timestamp,
+            }),
+            Ok(entry) => Ok(SstableLookupResult::Found {
+                value: entry.value,
+                timestamp: entry.timestamp,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn try_read_entry_sync(&self, offset: u64) -> Result<SSTableEntry> {
+        self.ensure_file_open_sync()?;
+        let file_size = self.metadata.file_size.max(self.reader.file_size_blocking()?);
+        if offset + 8 > file_size {
+            return Err(LsmError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("entry header past EOF at {offset}"),
+            )));
+        }
+        let entry_size = self.reader.read_u32_le_at_blocking(offset)?;
+        if entry_size == 0 || entry_size > 100 * 1024 * 1024 {
+            return Err(LsmError::Corruption(format!(
+                "invalid entry size {entry_size} at {offset}"
+            )));
+        }
+        let required = offset + 4 + entry_size as u64 + 4;
+        if required > file_size {
+            return Err(LsmError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("entry body past EOF at {offset}"),
+            )));
+        }
+        let mut entry_buffer = vec![0u8; entry_size as usize];
+        self.reader
+            .read_exact_at_blocking(offset + 4, &mut entry_buffer)?;
+        let stored_checksum = self
+            .reader
+            .read_u32_le_at_blocking(offset + 4 + entry_size as u64)?;
+        let mut entry_hasher = Crc32Hasher::new();
+        entry_hasher.update(&entry_size.to_le_bytes());
+        entry_hasher.update(&entry_buffer);
+        if stored_checksum != entry_hasher.finalize() {
+            return Err(LsmError::Corruption(format!(
+                "SSTable entry checksum mismatch at offset {offset}"
+            )));
+        }
+        bincode::deserialize(&entry_buffer)
+            .map_err(|e| LsmError::Serialization(format!("Failed to deserialize entry: {e}")))
     }
 
     /// Lookup that distinguishes tombstones from misses (needed for L0 merge).
@@ -1597,65 +1643,52 @@ impl SSTable {
             )));
         }
 
-        let mut entries = Vec::with_capacity(self.index.len());
+        let expected = self.index.len();
+        let mut entries = Vec::with_capacity(expected);
 
         // Iterate over index - this is safe as the index is only modified during SSTable creation
         for (key, (offset, size)) in &self.index {
-            // Double-check deletion status before each read
             if self.is_marked_for_deletion() {
-                warn!(
-                    "SSTable {:?} was marked for deletion during get_all_entries, stopping read",
-                    self.path
-                );
-                // Return partial results rather than error - compaction can use what it has
-                break;
+                return Err(LsmError::Internal(format!(
+                    "SSTable {:?} marked for deletion during get_all_entries (got {} of {})",
+                    self.path,
+                    entries.len(),
+                    expected
+                )));
             }
 
-            // Validate offset and size before reading
             if *offset > self.metadata.file_size {
-                warn!(
-                    "Invalid offset {} for key '{}' (exceeds file size {}), skipping",
-                    offset, key, self.metadata.file_size
-                );
-                continue;
+                return Err(LsmError::Internal(format!(
+                    "Invalid offset {} for key '{}' in {:?} (file size {})",
+                    offset, key, self.path, self.metadata.file_size
+                )));
             }
 
             if *size == 0 || *size > 100 * 1024 * 1024 {
-                warn!("Invalid entry size {} for key '{}', skipping", size, key);
-                continue;
+                return Err(LsmError::Internal(format!(
+                    "Invalid entry size {} for key '{}' in {:?}",
+                    size, key, self.path
+                )));
             }
 
             match self.try_read_entry(*offset, None).await {
-                Ok(entry) => {
-                    // Verify the key matches (sanity check)
-                    if entry.key == *key {
-                        entries.push(entry);
-                    } else {
-                        warn!(
-                            "Key mismatch in SSTable entry: index key '{}' != entry key '{}'",
-                            key, entry.key
-                        );
-                        // Still add the entry, but log the mismatch
-                        entries.push(entry);
-                    }
-                }
+                Ok(entry) => entries.push(entry),
                 Err(e) => {
-                    // Check if this is a deletion-related error - if so, stop reading
-                    if self.is_marked_for_deletion() {
-                        warn!(
-                            "SSTable {:?} marked for deletion during get_all_entries, stopping read",
-                            self.path
-                        );
-                        break;
-                    }
-
-                    warn!(
-                        "Failed to read entry for key '{}' at offset {}: {}. Skipping entry.",
-                        key, offset, e
-                    );
-                    // Continue with other entries rather than failing completely
+                    return Err(LsmError::Internal(format!(
+                        "Failed to read key '{}' at offset {} in {:?}: {}",
+                        key, offset, self.path, e
+                    )));
                 }
             }
+        }
+
+        if entries.len() != expected {
+            return Err(LsmError::Internal(format!(
+                "SSTable {:?} partial read: got {} of {} entries",
+                self.path,
+                entries.len(),
+                expected
+            )));
         }
 
         Ok(entries)
