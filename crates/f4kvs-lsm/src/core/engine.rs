@@ -182,6 +182,20 @@ enum GetKind {
     Miss,
 }
 
+/// Stateful prefix scan: one index position per SSTable so next() is O(sources),
+/// not a full Get from scratch (which livelocked verify at ~600% CPU).
+pub struct PrefixScanState {
+    prefix: String,
+    last: Option<String>,
+    heads: Vec<(usize, usize, usize)>, // level, idx, pos
+}
+
+impl PrefixScanState {
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+}
+
 impl LsmTreeEngine {
     /// Create a new LSM tree engine
     pub async fn new(config: LsmConfig) -> Result<Self> {
@@ -441,49 +455,78 @@ impl LsmTreeEngine {
         prefix: &str,
         after: Option<&str>,
     ) -> std::result::Result<Option<(String, Value)>, F4KvsError> {
+        let mut st = self
+            .prefix_scan_start(prefix)
+            .await
+            .map_err(Self::convert_error)?;
+        st.last = after.map(str::to_owned);
+        if let Some(last) = st.last.clone() {
+            self.prefix_scan_seek_after(&mut st, &last).await;
+        }
+        self.prefix_scan_next(&mut st).await
+    }
+
+    pub async fn prefix_scan_start(&self, prefix: &str) -> Result<PrefixScanState> {
+        let sstables = self.sstables.read().await;
+        let mut heads = Vec::new();
+        for (&level, files) in sstables.iter() {
+            for (idx, sstable) in files.iter().enumerate() {
+                heads.push((level, idx, sstable.index_start(prefix)));
+            }
+        }
+        Ok(PrefixScanState {
+            prefix: prefix.to_owned(),
+            last: None,
+            heads,
+        })
+    }
+
+    async fn prefix_scan_seek_after(&self, st: &mut PrefixScanState, after: &str) {
+        let sstables = self.sstables.read().await;
+        for (level, idx, pos) in st.heads.iter_mut() {
+            let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
+                continue;
+            };
+            let mut i = sstable.index_start(after);
+            if sstable.index_key_at(i) == Some(after.as_bytes()) {
+                i += 1;
+            }
+            *pos = i;
+        }
+    }
+
+    pub async fn prefix_scan_next(
+        &self,
+        st: &mut PrefixScanState,
+    ) -> std::result::Result<Option<(String, Value)>, F4KvsError> {
         let _op_guard = self.operation_guard.read().await;
-        let mut after = after.map(str::to_owned);
         loop {
             let Some(key) = self
-                .next_key_in_prefix(prefix, after.as_deref())
+                .prefix_scan_min_key(st)
                 .await
                 .map_err(Self::convert_error)?
             else {
                 return Ok(None);
             };
-            match self
-                .get_from_memtables(&key)
+            let resolved = self
+                .prefix_scan_resolve(st, &key)
                 .await
-                .map_err(Self::convert_error)?
-            {
-                MemtableLookupResult::Found(value) => return Ok(Some((key, value))),
-                MemtableLookupResult::Tombstone => {
-                    after = Some(key);
-                    continue;
-                }
-                MemtableLookupResult::Missing => {}
-            }
-            match self
-                .get_from_sstables(&key)
-                .await
-                .map_err(Self::convert_error)?
-            {
+                .map_err(Self::convert_error)?;
+            self.prefix_scan_advance(st, &key).await;
+            match resolved {
                 Some(value) => return Ok(Some((key, value))),
-                None => {
-                    after = Some(key);
-                    continue;
-                }
+                None => continue,
             }
         }
     }
 
-    async fn next_key_in_prefix(&self, prefix: &str, after: Option<&str>) -> Result<Option<String>> {
+    async fn prefix_scan_min_key(&self, st: &PrefixScanState) -> Result<Option<String>> {
         let mut best: Option<String> = None;
         let consider = |best: &mut Option<String>, cand: String| {
-            if !cand.starts_with(prefix) {
+            if !cand.starts_with(&st.prefix) {
                 return;
             }
-            if after.is_some_and(|a| cand.as_str() <= a) {
+            if st.last.as_deref().map(|a| cand.as_str() <= a) == Some(true) {
                 return;
             }
             match best {
@@ -492,32 +535,93 @@ impl LsmTreeEngine {
                 _ => {}
             }
         };
-
+        {
+            let sstables = self.sstables.read().await;
+            for (level, idx, pos) in &st.heads {
+                let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
+                    continue;
+                };
+                if let Some(k) = sstable.index_key_at(*pos) {
+                    consider(&mut best, String::from_utf8_lossy(k).into_owned());
+                }
+            }
+        }
         {
             let mt = self.active_memtable.read().await;
-            if let Some(k) = mt.first_key_after(prefix, after).await? {
+            if let Some(k) = mt.first_key_after(&st.prefix, st.last.as_deref()).await? {
                 consider(&mut best, k);
             }
         }
         {
             let imm = self.immutable_memtables.read().await;
             for mt in imm.iter() {
-                if let Some(k) = mt.first_key_after(prefix, after).await? {
+                if let Some(k) = mt.first_key_after(&st.prefix, st.last.as_deref()).await? {
                     consider(&mut best, k);
                 }
             }
         }
-        {
-            let sstables = self.sstables.read().await;
-            for level_sstables in sstables.values() {
-                for sstable in level_sstables {
-                    if let Some(k) = sstable.first_key_after(prefix, after) {
-                        consider(&mut best, k);
-                    }
-                }
+        Ok(best)
+    }
+
+    async fn prefix_scan_advance(&self, st: &mut PrefixScanState, key: &str) {
+        st.last = Some(key.to_owned());
+        let sstables = self.sstables.read().await;
+        for (level, idx, pos) in st.heads.iter_mut() {
+            let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
+                continue;
+            };
+            if sstable.index_key_at(*pos) == Some(key.as_bytes()) {
+                *pos += 1;
             }
         }
-        Ok(best)
+    }
+
+    async fn prefix_scan_resolve(
+        &self,
+        st: &PrefixScanState,
+        key: &str,
+    ) -> Result<Option<Value>> {
+        use crate::storage::sstable::SstableLookupResult;
+        match self.get_from_memtables(key).await? {
+            MemtableLookupResult::Found(value) => return Ok(Some(value)),
+            MemtableLookupResult::Tombstone => return Ok(None),
+            MemtableLookupResult::Missing => {}
+        }
+        let sstables = self.sstables.read().await;
+        let mut best_ts: u64 = 0;
+        let mut best: Option<SstableLookupResult> = None;
+        for (level, idx, pos) in &st.heads {
+            let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
+                continue;
+            };
+            if sstable.index_key_at(*pos) != Some(key.as_bytes()) {
+                continue;
+            }
+            match sstable.lookup_sync(key) {
+                Ok(SstableLookupResult::Missing) => {}
+                Ok(hit) => {
+                    let ts = match &hit {
+                        SstableLookupResult::Found { timestamp, .. } => *timestamp,
+                        SstableLookupResult::Tombstone { timestamp } => *timestamp,
+                        SstableLookupResult::Missing => 0,
+                    };
+                    if *level == 0 {
+                        if ts >= best_ts {
+                            best_ts = ts;
+                            best = Some(hit);
+                        }
+                    } else if best.is_none() {
+                        best = Some(hit);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(match best {
+            Some(SstableLookupResult::Found { value, .. }) => Some(value),
+            Some(SstableLookupResult::Tombstone { .. }) | None => None,
+            Some(SstableLookupResult::Missing) => None,
+        })
     }
 
     /// Rebuild live key count from SSTable metadata + memtables (startup).

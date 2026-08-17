@@ -801,6 +801,14 @@ impl SSTable {
         Ok(())
     }
 
+    pub(crate) fn index_start(&self, prefix: &str) -> usize {
+        self.index.partition_point(prefix.as_bytes())
+    }
+
+    pub(crate) fn index_key_at(&self, pos: usize) -> Option<&[u8]> {
+        self.index.at(pos).map(|(k, _)| k)
+    }
+
     /// Smallest key in `(after, ∞)` that starts with `prefix`.
     pub fn first_key_after(&self, prefix: &str, after: Option<&str>) -> Option<String> {
         if !self.is_ready() {
