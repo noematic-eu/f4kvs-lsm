@@ -801,6 +801,28 @@ impl SSTable {
         Ok(())
     }
 
+    /// Smallest key in `(after, ∞)` that starts with `prefix`.
+    pub fn first_key_after(&self, prefix: &str, after: Option<&str>) -> Option<String> {
+        if !self.is_ready() {
+            return None;
+        }
+        let bound = after.unwrap_or(prefix);
+        let mut i = self.index.partition_point(bound.as_bytes());
+        if after.is_some() {
+            if let Some((k, _)) = self.index.at(i) {
+                if k == bound.as_bytes() {
+                    i += 1;
+                }
+            }
+        }
+        let (k, _) = self.index.at(i)?;
+        if k.starts_with(prefix.as_bytes()) {
+            Some(String::from_utf8_lossy(k).into_owned())
+        } else {
+            None
+        }
+    }
+
     /// Fast check: key could exist in this SSTable (range + bloom). Does not touch the file.
     pub fn key_may_exist(&self, key: &str) -> bool {
         if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {

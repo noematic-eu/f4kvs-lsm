@@ -4,8 +4,36 @@ use crate::core::config::MemtableConfig;
 use crate::error::Result;
 use f4kvs_value::Value;
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+fn first_key_after_map(
+    data: &BTreeMap<String, Value>,
+    prefix: &str,
+    after: Option<&str>,
+) -> Option<String> {
+    match after {
+        Some(a) => {
+            for (k, _) in data.range((Bound::Excluded(a.to_string()), Bound::Unbounded)) {
+                if !k.starts_with(prefix) {
+                    return None;
+                }
+                return Some(k.clone());
+            }
+            None
+        }
+        None => {
+            for (k, _) in data.range(prefix.to_string()..) {
+                if !k.starts_with(prefix) {
+                    return None;
+                }
+                return Some(k.clone());
+            }
+            None
+        }
+    }
+}
 
 /// Effect of a put on memtable key visibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +148,12 @@ impl Memtable {
             Some(value) => Ok(MemtableLookupResult::Found(value.clone())),
             None => Ok(MemtableLookupResult::Missing),
         }
+    }
+
+    /// First key in `(after, ∞)` that starts with `prefix`. `after = None` starts at prefix.
+    pub async fn first_key_after(&self, prefix: &str, after: Option<&str>) -> Result<Option<String>> {
+        let data = self.data.read().await;
+        Ok(first_key_after_map(&data, prefix, after))
     }
 
     /// Non-blocking lookup. `None` if a writer holds the lock.

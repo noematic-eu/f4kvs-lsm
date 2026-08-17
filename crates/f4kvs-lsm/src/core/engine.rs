@@ -435,6 +435,91 @@ impl LsmTreeEngine {
         Some(Ok(None))
     }
 
+    /// Next live key/value in prefix after `after` (lexicographic). Tombstones skipped.
+    pub async fn scan_next(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> std::result::Result<Option<(String, Value)>, F4KvsError> {
+        let _op_guard = self.operation_guard.read().await;
+        let mut after = after.map(str::to_owned);
+        loop {
+            let Some(key) = self
+                .next_key_in_prefix(prefix, after.as_deref())
+                .await
+                .map_err(Self::convert_error)?
+            else {
+                return Ok(None);
+            };
+            match self
+                .get_from_memtables(&key)
+                .await
+                .map_err(Self::convert_error)?
+            {
+                MemtableLookupResult::Found(value) => return Ok(Some((key, value))),
+                MemtableLookupResult::Tombstone => {
+                    after = Some(key);
+                    continue;
+                }
+                MemtableLookupResult::Missing => {}
+            }
+            match self
+                .get_from_sstables(&key)
+                .await
+                .map_err(Self::convert_error)?
+            {
+                Some(value) => return Ok(Some((key, value))),
+                None => {
+                    after = Some(key);
+                    continue;
+                }
+            }
+        }
+    }
+
+    async fn next_key_in_prefix(&self, prefix: &str, after: Option<&str>) -> Result<Option<String>> {
+        let mut best: Option<String> = None;
+        let consider = |best: &mut Option<String>, cand: String| {
+            if !cand.starts_with(prefix) {
+                return;
+            }
+            if after.is_some_and(|a| cand.as_str() <= a) {
+                return;
+            }
+            match best {
+                None => *best = Some(cand),
+                Some(cur) if cand < *cur => *best = Some(cand),
+                _ => {}
+            }
+        };
+
+        {
+            let mt = self.active_memtable.read().await;
+            if let Some(k) = mt.first_key_after(prefix, after).await? {
+                consider(&mut best, k);
+            }
+        }
+        {
+            let imm = self.immutable_memtables.read().await;
+            for mt in imm.iter() {
+                if let Some(k) = mt.first_key_after(prefix, after).await? {
+                    consider(&mut best, k);
+                }
+            }
+        }
+        {
+            let sstables = self.sstables.read().await;
+            for level_sstables in sstables.values() {
+                for sstable in level_sstables {
+                    if let Some(k) = sstable.first_key_after(prefix, after) {
+                        consider(&mut best, k);
+                    }
+                }
+            }
+        }
+        Ok(best)
+    }
+
     /// Rebuild live key count from SSTable metadata + memtables (startup).
     ///
     /// Avoids a full merge scan on open — that made vault browse wait minutes on multi-million-key trees.
@@ -4243,6 +4328,38 @@ mod tests {
         assert_eq!(
             engine.get("b_key1").await.expect("Failed to get b_key1"),
             Some(Value::String("value3".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_next_skips_tombstones_and_orders() {
+        let (engine, _temp_dir) = create_test_engine().await;
+        for (k, v) in [("a1", "1"), ("a2", "2"), ("a3", "3"), ("b1", "x")] {
+            engine
+                .put(k, &Value::Bytes(v.as_bytes().to_vec()))
+                .await
+                .unwrap();
+        }
+        engine.delete("a2").await.unwrap();
+        engine.flush().await.unwrap();
+
+        let mut after: Option<String> = None;
+        let mut got = Vec::new();
+        loop {
+            match engine.scan_next("a", after.as_deref()).await.unwrap() {
+                None => break,
+                Some((k, Value::Bytes(b))) => {
+                    got.push((k.clone(), String::from_utf8(b).unwrap()));
+                    after = Some(k);
+                }
+                Some((k, _)) => {
+                    after = Some(k);
+                }
+            }
+        }
+        assert_eq!(
+            got,
+            vec![("a1".into(), "1".into()), ("a3".into(), "3".into())]
         );
     }
 
