@@ -11,6 +11,7 @@ use f4kvs_value::Value;
 use serde::{Deserialize, Serialize};
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::time::{sleep, Duration};
@@ -517,11 +518,11 @@ pub struct SSTable {
     /// Last access time for LRU eviction (nanoseconds since epoch)
     last_access: std::sync::atomic::AtomicU64,
 
-    /// Active reader count (for preventing deletion during reads)
-    reader_count: std::sync::atomic::AtomicUsize,
+    /// Active reader count (shared across clones so reclaim waits on live pins).
+    reader_count: Arc<std::sync::atomic::AtomicUsize>,
 
-    /// Marked for deletion (pending until all readers done)
-    marked_for_deletion: std::sync::atomic::AtomicBool,
+    /// Marked for deletion (shared across clones — compaction clones inputs).
+    marked_for_deletion: Arc<std::sync::atomic::AtomicBool>,
 
     /// Ready flag: indicates SSTable is fully written, synced, and metadata/index are loaded
     /// This prevents reads from happening before the SSTable is in a consistent state
@@ -569,8 +570,8 @@ impl SSTable {
             bloom_filter: None,
             reader,
             last_access: std::sync::atomic::AtomicU64::new(0),
-            reader_count: std::sync::atomic::AtomicUsize::new(0),
-            marked_for_deletion: std::sync::atomic::AtomicBool::new(false),
+            reader_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            marked_for_deletion: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_ready: std::sync::atomic::AtomicBool::new(false),
             block_compressed: std::sync::atomic::AtomicBool::new(false),
             decompressed_block: std::sync::Mutex::new(None),
@@ -1087,9 +1088,8 @@ impl SSTable {
         if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
-        if self.is_marked_for_deletion() {
-            return false;
-        }
+        // Marked files stay readable for pinned scanners/gets until reclaim
+        // unlinks. New map walkers skip them via `is_marked_for_deletion`.
         if key < self.metadata.smallest_key.as_str() || key > self.metadata.largest_key.as_str() {
             return false;
         }
@@ -1113,7 +1113,7 @@ impl SSTable {
     ) -> Result<Option<Value>> {
         self.reader_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let mut guard = ReaderGuard::new(&self.reader_count, false);
+        let mut guard = ReaderGuard::new(self.reader_count.as_ref(), false);
         self.get_with_reader_guard(key, block_cache, &mut guard)
             .await
     }
@@ -1285,7 +1285,7 @@ impl SSTable {
         key: &str,
         block_cache: Option<&SharedBlockCache>,
     ) -> Result<SstableLookupResult> {
-        let mut guard = ReaderGuard::new(&self.reader_count, true);
+        let mut guard = ReaderGuard::new(self.reader_count.as_ref(), true);
         self.lookup_with_reader_guard(key, block_cache, &mut guard)
             .await
     }
@@ -2122,7 +2122,12 @@ impl SSTable {
         self.metadata.file_size
     }
 
-    /// Clone the SSTable (for testing purposes)
+    /// Clone for compaction / prefix-scan pins.
+    ///
+    /// `reader_count` and `marked_for_deletion` are **shared**. Compaction
+    /// clones inputs then `reclaim_compacted_inputs` marks/waits — a fresh
+    /// atomic here made `wait_for_readers` return immediately and unlinked
+    /// the file while the live-map instance was still pinned.
     pub fn clone_for_testing(&self) -> Self {
         Self {
             path: self.path.clone(),
@@ -2145,8 +2150,8 @@ impl SSTable {
             last_access: std::sync::atomic::AtomicU64::new(
                 self.last_access.load(std::sync::atomic::Ordering::Relaxed),
             ),
-            reader_count: std::sync::atomic::AtomicUsize::new(0),
-            marked_for_deletion: std::sync::atomic::AtomicBool::new(false),
+            reader_count: Arc::clone(&self.reader_count),
+            marked_for_deletion: Arc::clone(&self.marked_for_deletion),
             is_ready: std::sync::atomic::AtomicBool::new(
                 self.is_ready.load(std::sync::atomic::Ordering::Relaxed),
             ),
@@ -2269,5 +2274,20 @@ mod compress_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn clone_shares_reader_pin_and_delete_flag() {
+        let dir = TempDir::new().unwrap();
+        let sst = SSTable::new(dir.path().join("pin.sst"), SstableConfig::default(), 0).unwrap();
+        sst.pin_reader();
+        let clone = sst.clone();
+        assert_eq!(clone.reader_count(), 1, "clone must see the live pin");
+        clone.mark_for_deletion();
+        assert!(sst.is_marked_for_deletion(), "mark must be shared");
+        assert!(!clone.can_delete(), "pinned clone must block unlink");
+        sst.unpin_reader();
+        assert_eq!(clone.reader_count(), 0);
+        assert!(clone.can_delete());
     }
 }

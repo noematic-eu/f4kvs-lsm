@@ -182,17 +182,34 @@ enum GetKind {
     Miss,
 }
 
+/// One SST source in a prefix scan. Holds a clone (shared pin counters) so
+/// compaction replacing the live map cannot silently skip keys, and reclaim
+/// cannot unlink the file until this head is dropped.
+struct PrefixScanHead {
+    sst: SSTable,
+    level: usize,
+    pos: usize,
+}
+
 /// Stateful prefix scan: one index position per SSTable so next() is O(sources),
 /// not a full Get from scratch (which livelocked verify at ~600% CPU).
 pub struct PrefixScanState {
     prefix: String,
     last: Option<String>,
-    heads: Vec<(usize, usize, usize)>, // level, idx, pos
+    heads: Vec<PrefixScanHead>,
 }
 
 impl PrefixScanState {
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+}
+
+impl Drop for PrefixScanState {
+    fn drop(&mut self) {
+        for head in &self.heads {
+            head.sst.unpin_reader();
+        }
     }
 }
 
@@ -486,8 +503,14 @@ impl LsmTreeEngine {
         let sstables = self.sstables.read().await;
         let mut heads = Vec::new();
         for (&level, files) in sstables.iter() {
-            for (idx, sstable) in files.iter().enumerate() {
-                heads.push((level, idx, sstable.index_start(prefix)));
+            for sstable in files.iter() {
+                if !sstable.is_ready() || sstable.is_marked_for_deletion() {
+                    continue;
+                }
+                let pos = sstable.index_start(prefix);
+                let sst = sstable.clone();
+                sst.pin_reader();
+                heads.push(PrefixScanHead { sst, level, pos });
             }
         }
         Ok(PrefixScanState {
@@ -498,16 +521,12 @@ impl LsmTreeEngine {
     }
 
     async fn prefix_scan_seek_after(&self, st: &mut PrefixScanState, after: &str) {
-        let sstables = self.sstables.read().await;
-        for (level, idx, pos) in st.heads.iter_mut() {
-            let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
-                continue;
-            };
-            let mut i = sstable.index_start(after);
-            if sstable.index_key_eq(i, after.as_bytes()) {
+        for head in st.heads.iter_mut() {
+            let mut i = head.sst.index_start(after);
+            if head.sst.index_key_eq(i, after.as_bytes()) {
                 i += 1;
             }
-            *pos = i;
+            head.pos = i;
         }
     }
 
@@ -552,12 +571,8 @@ impl LsmTreeEngine {
             }
         };
         {
-            let sstables = self.sstables.read().await;
-            for (level, idx, pos) in &st.heads {
-                let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
-                    continue;
-                };
-                if let Some(k) = sstable.index_key_at(*pos) {
+            for head in &st.heads {
+                if let Some(k) = head.sst.index_key_at(head.pos) {
                     consider(&mut best, String::from_utf8_lossy(&k).into_owned());
                 }
             }
@@ -581,13 +596,9 @@ impl LsmTreeEngine {
 
     async fn prefix_scan_advance(&self, st: &mut PrefixScanState, key: &str) {
         st.last = Some(key.to_owned());
-        let sstables = self.sstables.read().await;
-        for (level, idx, pos) in st.heads.iter_mut() {
-            let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
-                continue;
-            };
-            if sstable.index_key_eq(*pos, key.as_bytes()) {
-                *pos += 1;
+        for head in st.heads.iter_mut() {
+            if head.sst.index_key_eq(head.pos, key.as_bytes()) {
+                head.pos += 1;
             }
         }
     }
@@ -603,17 +614,13 @@ impl LsmTreeEngine {
             MemtableLookupResult::Tombstone => return Ok(None),
             MemtableLookupResult::Missing => {}
         }
-        let sstables = self.sstables.read().await;
         let mut best_ts: u64 = 0;
         let mut best: Option<SstableLookupResult> = None;
-        for (level, idx, pos) in &st.heads {
-            let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
-                continue;
-            };
-            if !sstable.index_key_eq(*pos, key.as_bytes()) {
+        for head in &st.heads {
+            if !head.sst.index_key_eq(head.pos, key.as_bytes()) {
                 continue;
             }
-            match sstable.lookup_sync(key, Some(&self.block_cache)) {
+            match head.sst.lookup_sync(key, Some(&self.block_cache)) {
                 Ok(SstableLookupResult::Missing) => {}
                 Ok(hit) => {
                     let ts = match &hit {
@@ -621,7 +628,7 @@ impl LsmTreeEngine {
                         SstableLookupResult::Tombstone { timestamp } => *timestamp,
                         SstableLookupResult::Missing => 0,
                     };
-                    if *level == 0 {
+                    if head.level == 0 {
                         if ts >= best_ts {
                             best_ts = ts;
                             best = Some(hit);
@@ -4570,6 +4577,60 @@ mod tests {
             got,
             vec![("a1".into(), "1".into()), ("a3".into(), "3".into())]
         );
+    }
+
+    /// Compaction used to rewrite the live map while scan heads were
+    /// `(level, idx)` into that map — next() silently skipped keys. Heads
+    /// now pin cloned SSTables (shared reader_count) so compact_all cannot
+    /// drop or reorder the sources mid-scan.
+    #[tokio::test]
+    async fn prefix_scan_completes_across_compact_all() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            levels: LevelConfig {
+                max_sstables_per_level: 2,
+                ..Default::default()
+            },
+            compaction: CompactionConfig {
+                background_enabled: false,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        };
+        let engine = LsmTreeEngine::new(config).await.expect("engine");
+        let n = 40;
+        for i in 0..n {
+            engine
+                .put(
+                    &format!("p/{i:04}"),
+                    &Value::Bytes(format!("v{i}").into_bytes()),
+                )
+                .await
+                .expect("put");
+            engine.flush().await.expect("flush");
+        }
+
+        let mut st = engine.prefix_scan_start("p/").await.expect("start");
+        let first = engine.prefix_scan_next(&mut st).await.expect("first");
+        assert!(first.is_some(), "scan must yield at least one key");
+
+        engine.compact_all().await.expect("compact_all mid-scan");
+
+        let mut got = vec![first.unwrap().0];
+        while let Some((k, _)) = engine.prefix_scan_next(&mut st).await.expect("next") {
+            got.push(k);
+        }
+        got.sort();
+        let expect: Vec<String> = (0..n).map(|i| format!("p/{i:04}")).collect();
+        assert_eq!(got, expect, "compaction must not skip prefix-scan keys");
     }
 
     #[tokio::test]
