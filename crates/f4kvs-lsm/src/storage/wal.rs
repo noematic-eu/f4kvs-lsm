@@ -104,6 +104,52 @@ impl WALSegment {
         Ok(segment)
     }
 
+    /// Reopen the last on-disk segment if it has no entries (catalog browse
+    /// used to `rotate_segment` + fsync a new empty file on every shard open).
+    /// Returns `None` when the file is missing or already has data.
+    pub async fn open_empty_for_append(
+        path: PathBuf,
+        max_size: u64,
+        sync_mode: WalSyncMode,
+    ) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file_len = tokio::fs::metadata(&path).await.map_err(LsmError::Io)?.len();
+        let header_size = bincode::serialized_size(&WALSegmentHeader {
+            magic: Self::MAGIC,
+            version: Self::VERSION,
+            created_at: 0,
+            entry_count: 0,
+        })
+        .map_err(|e| LsmError::Serialization(format!("Failed to get header size: {}", e)))?
+            as u64;
+        if file_len != header_size {
+            return Ok(None);
+        }
+        let file = OpenOptions::new()
+            .create(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await
+            .map_err(LsmError::Io)?;
+        let header = WALSegmentHeader {
+            magic: Self::MAGIC,
+            version: Self::VERSION,
+            created_at: utils::timestamp_secs(),
+            entry_count: 0,
+        };
+        Ok(Some(Self {
+            path,
+            file,
+            header,
+            entry_count: 0,
+            max_size,
+            sync_mode,
+        }))
+    }
+
     /// Open an existing WAL segment for reading.
     ///
     /// Empty or header-incomplete files (SIGKILL mid-`WALSegment::new` / mid-truncate
@@ -532,13 +578,46 @@ impl WALManager {
 
         // Check for existing segments and set counter appropriately
         self.scan_existing_segments().await?;
-        self.rotate_segment().await?;
+        // Catalog browse opens every shard read-mostly. Creating + fsyncing a
+        // new empty segment on each open cost 5–13 ms and left a trail of
+        // empty files. Reuse the last segment when it has no entries.
+        if !self.try_reuse_last_empty_segment().await? {
+            self.rotate_segment().await?;
+        }
 
         if self.group_commit_enabled() {
             self.start_group_commit().await?;
         }
 
         Ok(())
+    }
+
+    /// Reuse `segment_{max_id}` when it is header-only / empty.
+    async fn try_reuse_last_empty_segment(&self) -> Result<bool> {
+        let next_id = self
+            .segment_counter
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if next_id <= 1 {
+            return Ok(false);
+        }
+        let last_id = next_id - 1;
+        let path = self
+            .wal_dir
+            .join(format!("segment_{:016x}.wal", last_id));
+        match WALSegment::open_empty_for_append(
+            path,
+            self.config.segment_size as u64,
+            self.config.sync_mode,
+        )
+        .await?
+        {
+            Some(segment) => {
+                *self.current_segment.write().await = Some(segment);
+                debug!("WAL: reused empty segment {last_id:016x}");
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Scan for existing WAL segments and set counter appropriately

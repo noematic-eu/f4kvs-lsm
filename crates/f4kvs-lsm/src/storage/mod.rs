@@ -5,6 +5,7 @@
 
 pub mod block_cache;
 pub mod file_reader;
+pub mod flat_index;
 pub mod mmap_reader;
 pub mod memtable;
 pub mod sstable;
