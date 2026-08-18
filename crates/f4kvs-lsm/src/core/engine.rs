@@ -1384,13 +1384,26 @@ impl LsmTreeEngine {
                 let mut interval = tokio::time::interval(compaction_interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    interval.tick().await;
-                    if shutdown.load(Ordering::Relaxed) {
-                        debug!("Background compaction task shutting down");
-                        break;
-                    }
-                    if let Err(e) = compaction_manager.compact_if_needed(&sstables).await {
-                        warn!("Background compaction failed: {}", e);
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if shutdown.load(Ordering::Relaxed) {
+                                debug!("Background compaction task shutting down");
+                                break;
+                            }
+                            if let Err(e) = compaction_manager.compact_if_needed(&sstables).await {
+                                warn!("Background compaction failed: {}", e);
+                            }
+                        }
+                        // Poll shutdown between ticks: the default compaction
+                        // interval is 60s and shutdown_background_tasks() joins
+                        // this task, so without this arm graceful shutdown
+                        // blocks for up to a full interval.
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            if shutdown.load(Ordering::Relaxed) {
+                                debug!("Background compaction task shutting down");
+                                break;
+                            }
+                        }
                     }
                 }
             });
