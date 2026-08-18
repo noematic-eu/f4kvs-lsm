@@ -3,9 +3,8 @@
 //! This module provides an LRU-based block cache for efficient read operations.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::RwLock;
 
 /// Cached block data
 #[derive(Debug, Clone)]
@@ -188,54 +187,76 @@ pub struct CacheStats {
     pub hit_rate: f64,
 }
 
-/// Thread-safe block cache wrapper
+/// Thread-safe block cache wrapper.
+///
+/// Uses `std::sync::Mutex` so FFI `lookup_sync` can hit decompressed Snappy
+/// blocks without taking the tokio runtime (the previous `tokio::RwLock`
+/// left the hot Get path decompressing 32 KiB on every point lookup).
 #[derive(Debug)]
 pub struct SharedBlockCache {
-    cache: Arc<RwLock<BlockCache>>,
+    cache: Arc<Mutex<BlockCache>>,
 }
 
 impl SharedBlockCache {
     /// Create a new shared block cache
     pub fn new(max_size: usize) -> Self {
         Self {
-            cache: Arc::new(RwLock::new(BlockCache::new(max_size))),
+            cache: Arc::new(Mutex::new(BlockCache::new(max_size))),
+        }
+    }
+
+    pub fn get_sync(&self, key: &str) -> Option<Vec<u8>> {
+        let mut cache = self.cache.lock().ok()?;
+        cache.get(key).map(|data| data.to_vec())
+    }
+
+    pub fn put_sync(&self, key: String, data: Vec<u8>) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.put(key, data);
         }
     }
 
     /// Get a block from cache
     pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let mut cache = self.cache.write().await;
-        cache.get(key).map(|data| data.to_vec())
+        self.get_sync(key)
     }
 
     /// Put a block into cache
     pub async fn put(&self, key: String, data: Vec<u8>) {
-        let mut cache = self.cache.write().await;
-        cache.put(key, data);
+        self.put_sync(key, data);
     }
 
     /// Get cache statistics
     pub async fn stats(&self) -> CacheStats {
-        let cache = self.cache.read().await;
-        cache.stats()
+        self.cache
+            .lock()
+            .map(|c| c.stats())
+            .unwrap_or(CacheStats {
+                current_size: 0,
+                max_size: 0,
+                block_count: 0,
+                hit_rate: 0.0,
+            })
     }
 
     /// Export counters for storage stats.
     pub async fn metrics(&self) -> BlockCacheMetrics {
-        let cache = self.cache.read().await;
-        cache.metrics()
+        self.cache
+            .lock()
+            .map(|c| c.metrics())
+            .unwrap_or_default()
     }
 
     /// Clear the cache
     pub async fn clear(&self) {
-        let mut cache = self.cache.write().await;
-        cache.clear();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
     }
 
     /// Remove a specific block
     pub async fn remove(&self, key: &str) -> Option<Vec<u8>> {
-        let mut cache = self.cache.write().await;
-        cache.remove(key)
+        self.cache.lock().ok()?.remove(key)
     }
 }
 

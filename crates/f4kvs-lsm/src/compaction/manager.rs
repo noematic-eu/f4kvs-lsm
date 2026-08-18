@@ -37,6 +37,21 @@ pub struct CompactionStats {
 /// Maximum concurrent SSTable operations during compaction
 const MAX_CONCURRENT_SSTABLE_OPS: usize = 4;
 
+/// On-disk size guess: key lives in the block and again in F4IX.
+fn estimated_sstable_bytes(entry: &SSTableEntry) -> usize {
+    entry.key.len().saturating_mul(2) + entry.value.serialized_size() + 64
+}
+
+/// L1+ files must be ordered by largest_key for `find_sstable_for_key`.
+fn sort_leveled_sstables(sstables: &mut [SSTable]) {
+    sstables.sort_by(|a, b| {
+        a.metadata()
+            .largest_key
+            .cmp(&b.metadata().largest_key)
+            .then_with(|| a.metadata().smallest_key.cmp(&b.metadata().smallest_key))
+    });
+}
+
 /// Compaction manager
 pub struct CompactionManager {
     config: CompactionConfig,
@@ -353,125 +368,121 @@ impl CompactionManager {
         Ok(())
     }
 
-    /// Run compaction on all levels
+    /// Manual / FFI compact: drain overlapping L0 into range-partitioned L1.
     ///
-    /// This function releases locks between levels to allow reads and other operations
-    /// to proceed during compaction, preventing deadlocks and improving concurrency.
-    ///
-    /// Note: New SSTables created during compaction (from concurrent writes) are preserved
-    /// by merging them with the compacted SSTables.
+    /// Does **not** consult `should_compact_level` (ingest raises
+    /// `max_sstables_per_level` so that check is a no-op). Does **not** rewrite
+    /// L1+ in the same pass. If L1 already exists, it is merged with L0 so
+    /// L1 ranges stay disjoint (Get uses binary search there).
     pub async fn compact_all(
         &self,
         sstables: &Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
     ) -> Result<()> {
-        for level in 0..self.level_config.count {
-            // Check if level needs compaction (read lock only)
-            let needs_compaction = {
-                let sstables_guard = sstables.read().await;
-                self.should_compact_level(
-                    level,
-                    &sstables_guard.get(&level).cloned().unwrap_or_default(),
-                )
-                .await
-            };
-
-            if needs_compaction {
-                info!("Compacting all levels, starting with level {}", level);
-
-                // Use try_write with retry to avoid blocking deadlocks
-                // This allows other operations to proceed if lock is contended
-                let mut sstables_guard = None;
-                for retry in 0..10 {
-                    match sstables.try_write() {
-                        Ok(guard) => {
-                            sstables_guard = Some(guard);
-                            break;
-                        }
-                        Err(_) => {
-                            if retry < 9 {
-                                // Yield to allow other tasks to release the lock
-                                tokio::time::sleep(Duration::from_millis(50 * (retry as u64 + 1)))
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                let mut sstables_guard = match sstables_guard {
-                    Some(guard) => guard,
-                    None => {
-                        // Fall back to blocking write with shorter timeout
-                        let lock_timeout = Duration::from_secs(5);
-                        timeout(lock_timeout, sstables.write()).await.map_err(|_| {
-                            LsmError::Internal(format!(
-                                "Failed to acquire compaction lock for level {} within timeout",
-                                level
-                            ))
-                        })?
-                    }
-                };
-
-                // Get SSTables for this level
-                let level_sstables = sstables_guard.get(&level).cloned().unwrap_or_default();
-
-                if level_sstables.is_empty() {
-                    continue; // No SSTables to compact
-                }
-
-                // Filter out SSTables that are not ready or marked for deletion
-                // This prevents reading from incomplete or being-deleted SSTables
-                let ready_sstables: Vec<SSTable> = level_sstables
-                    .into_iter()
-                    .filter(|s| s.is_ready() && !s.is_marked_for_deletion())
-                    .collect();
-
-                // Additional validation: ensure SSTables have valid metadata
-                let valid_sstables: Vec<SSTable> = ready_sstables
-                    .into_iter()
-                    .filter(|s| {
-                        let metadata = s.metadata();
-                        // Validate basic metadata consistency
-                        metadata.file_size > 0
-                            && metadata.entry_count > 0
-                            && s.index_size() > 0
-                            && s.index_size() == metadata.entry_count
-                    })
-                    .collect();
-
-                if valid_sstables.is_empty() {
-                    continue; // No valid SSTables to compact
-                }
-
-                // Perform compaction on valid SSTables only
-                let compacted_sstables =
-                    self.compact_level_sstables(level, &valid_sstables).await?;
-
-                // Mark compacted inputs for deletion (memory flag; files GC later).
-                for sstable in &valid_sstables {
-                    sstable.mark_for_deletion();
-                }
-
-                // Preserve SSTables that appeared during compaction I/O (concurrent
-                // flushes) — they were not in valid_sstables and must not be dropped
-                // from the in-memory index (would hide live tombstones until restart).
-                let input_paths: std::collections::HashSet<_> =
-                    valid_sstables.iter().map(|s| s.path().clone()).collect();
-                let concurrent: Vec<SSTable> = sstables_guard
-                    .get(&level)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|s| !input_paths.contains(s.path()) && !s.is_marked_for_deletion())
-                    .collect();
-
-                let mut merged = compacted_sstables;
-                merged.extend(concurrent);
-                sstables_guard.insert(level, merged);
-                drop(sstables_guard);
-                self.reclaim_compacted_inputs(&valid_sstables).await;
-            }
+        if self.level_config.count < 2 {
+            return Err(LsmError::Internal(
+                "compact_all needs at least 2 levels for L0→L1".into(),
+            ));
         }
 
+        let (valid_l0, valid_l1) = {
+            let guard = sstables.read().await;
+            (
+                Self::valid_sstables_for_compact(guard.get(&0).map(|v| v.as_slice()).unwrap_or(&[])),
+                Self::valid_sstables_for_compact(guard.get(&1).map(|v| v.as_slice()).unwrap_or(&[])),
+            )
+        };
+        let needs_rewrite = valid_l0
+            .iter()
+            .chain(valid_l1.iter())
+            .any(|s| !s.is_block_compressed());
+        if valid_l0.len() < 2 && !needs_rewrite {
+            debug!(
+                "compact_all: L0 has {} valid SSTables, already compressed",
+                valid_l0.len()
+            );
+            return Ok(());
+        }
+
+        let mut inputs = valid_l0;
+        inputs.extend(valid_l1);
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let input_paths: std::collections::HashSet<_> =
+            inputs.iter().map(|s| s.path().clone()).collect();
+
+        info!(
+            "Manual compact: merging {} SSTables into L1 (target {} bytes)",
+            inputs.len(),
+            self.sstable_config.target_size
+        );
+
+        let outputs = self.compact_level_sstables(1, &inputs).await?;
+
+        let mut guard = None;
+        for retry in 0..10 {
+            match sstables.try_write() {
+                Ok(g) => {
+                    guard = Some(g);
+                    break;
+                }
+                Err(_) if retry < 9 => {
+                    tokio::time::sleep(Duration::from_millis(50 * (retry as u64 + 1))).await;
+                }
+                Err(_) => {}
+            }
+        }
+        let mut guard = match guard {
+            Some(g) => g,
+            None => timeout(Duration::from_secs(5), sstables.write())
+                .await
+                .map_err(|_| {
+                    LsmError::Internal(
+                        "Failed to acquire compaction lock to install L1".into(),
+                    )
+                })?,
+        };
+
+        let concurrent_l0: Vec<SSTable> = guard
+            .get(&0)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !input_paths.contains(s.path()) && !s.is_marked_for_deletion())
+            .collect();
+        let concurrent_l1: Vec<SSTable> = guard
+            .get(&1)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !input_paths.contains(s.path()) && !s.is_marked_for_deletion())
+            .collect();
+
+        let mut l1 = outputs;
+        l1.extend(concurrent_l1);
+        sort_leveled_sstables(&mut l1);
+        guard.insert(0, concurrent_l0);
+        guard.insert(1, l1);
+        drop(guard);
+        self.reclaim_compacted_inputs(&inputs).await;
         Ok(())
+    }
+
+    fn valid_sstables_for_compact(sstables: &[SSTable]) -> Vec<SSTable> {
+        sstables
+            .iter()
+            .filter(|s| {
+                if !s.is_ready() || s.is_marked_for_deletion() {
+                    return false;
+                }
+                let metadata = s.metadata();
+                metadata.file_size > 0
+                    && metadata.entry_count > 0
+                    && s.index_size() > 0
+                    && s.index_size() == metadata.entry_count
+            })
+            .cloned()
+            .collect()
     }
 
     /// Compact a specific set of SSTables for a level
@@ -1179,15 +1190,14 @@ impl CompactionManager {
         }
 
         let mut sstables = Vec::new();
-        let target_size = self.sstable_config.target_size;
+        let target_size = self.sstable_config.target_size.max(1);
         let mut current_entries = Vec::new();
         let mut current_size = 0;
 
         for entry in entries {
-            let entry_size = entry.key.len() + entry.value.serialized_size() + 32; // Rough estimate
+            let entry_size = estimated_sstable_bytes(&entry);
 
             if current_size + entry_size > target_size && !current_entries.is_empty() {
-                // Create SSTable from current entries
                 let sstable = self
                     .create_sstable_from_entries(level, current_entries)
                     .await?;
@@ -1200,7 +1210,6 @@ impl CompactionManager {
             current_size += entry_size;
         }
 
-        // Create final SSTable if there are remaining entries
         if !current_entries.is_empty() {
             let sstable = self
                 .create_sstable_from_entries(level, current_entries)

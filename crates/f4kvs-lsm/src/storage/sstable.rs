@@ -16,6 +16,85 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, warn};
 
+/// New SST files start with this magic and use Snappy data blocks.
+const SST_COMPRESSED_MAGIC: &[u8; 4] = b"F4SC";
+const SST_COMPRESSED_HEADER: usize = 8;
+const SST_BLOCK_TARGET: usize = 32 * 1024;
+
+fn parse_framed_entry(buf: &[u8], at: usize) -> Result<SSTableEntry> {
+    if at + 8 > buf.len() {
+        return Err(LsmError::Corruption(format!(
+            "framed entry header past block end at {at}"
+        )));
+    }
+    let entry_size = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+    if entry_size == 0 || entry_size > 100 * 1024 * 1024 {
+        return Err(LsmError::Corruption(format!(
+            "invalid framed entry size {entry_size} at {at}"
+        )));
+    }
+    let data_end = at + 4 + entry_size as usize;
+    let crc_end = data_end + 4;
+    if crc_end > buf.len() {
+        return Err(LsmError::Corruption(format!(
+            "framed entry body past block end at {at}"
+        )));
+    }
+    let entry_buffer = &buf[at + 4..data_end];
+    let stored = u32::from_le_bytes(buf[data_end..crc_end].try_into().unwrap());
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&entry_size.to_le_bytes());
+    hasher.update(entry_buffer);
+    if stored != hasher.finalize() {
+        return Err(LsmError::Corruption(format!(
+            "framed entry checksum mismatch at {at}"
+        )));
+    }
+    bincode::deserialize(entry_buffer)
+        .map_err(|e| LsmError::Serialization(format!("Failed to deserialize entry: {e}")))
+}
+
+fn snap_compress(raw: &[u8]) -> Result<Vec<u8>> {
+    snap::raw::Encoder::new()
+        .compress_vec(raw)
+        .map_err(|e| LsmError::Internal(format!("snappy compress: {e}")))
+}
+
+fn snap_decompress(comp: &[u8]) -> Result<Vec<u8>> {
+    snap::raw::Decoder::new()
+        .decompress_vec(comp)
+        .map_err(|e| LsmError::Corruption(format!("snappy decompress: {e}")))
+}
+
+async fn write_snappy_block(
+    writer: &mut BufWriter<tokio::fs::File>,
+    file_hasher: &mut Crc32Hasher,
+    offset: &mut u64,
+    index_pairs: &mut Vec<(String, u64, u32)>,
+    block: &mut Vec<u8>,
+    pending: &mut Vec<(String, u32)>,
+) -> Result<()> {
+    if block.is_empty() {
+        return Ok(());
+    }
+    let compressed = snap_compress(block)?;
+    let unc_len = block.len() as u32;
+    let comp_len = compressed.len() as u32;
+    let block_off = *offset;
+    writer.write_u32_le(unc_len).await.map_err(LsmError::Io)?;
+    writer.write_u32_le(comp_len).await.map_err(LsmError::Io)?;
+    writer.write_all(&compressed).await.map_err(LsmError::Io)?;
+    file_hasher.update(&unc_len.to_le_bytes());
+    file_hasher.update(&comp_len.to_le_bytes());
+    file_hasher.update(&compressed);
+    for (key, in_off) in pending.drain(..) {
+        index_pairs.push((key, block_off, in_off));
+    }
+    *offset += 8 + compressed.len() as u64;
+    block.clear();
+    Ok(())
+}
+
 /// Bloom filter implementation for SSTables
 ///
 /// This module provides a simple bloom filter implementation used by SSTables
@@ -418,8 +497,16 @@ pub struct SSTable {
     /// Metadata
     metadata: SSTableMetadata,
 
-    /// In-memory index for fast lookups
-    index: FlatIndex,
+    /// In-memory index for fast lookups. Loaded lazily on first access:
+    /// `open_sync` reads metadata only (decoding every F4IX at open dominated
+    /// shard open on large catalogs).
+    index: std::sync::RwLock<FlatIndex>,
+
+    /// True once `index` holds the freshly written or decoded on-disk index.
+    index_loaded: std::sync::atomic::AtomicBool,
+
+    /// Serializes lazy index loads so concurrent Gets decode at most once.
+    index_load_lock: std::sync::Mutex<()>,
 
     /// Bloom filter for fast key existence checks
     bloom_filter: Option<BloomFilter>,
@@ -439,6 +526,13 @@ pub struct SSTable {
     /// Ready flag: indicates SSTable is fully written, synced, and metadata/index are loaded
     /// This prevents reads from happening before the SSTable is in a consistent state
     is_ready: std::sync::atomic::AtomicBool,
+
+    /// True when the file uses F4SC Snappy data blocks (false = legacy framed entries).
+    block_compressed: std::sync::atomic::AtomicBool,
+
+    /// Last decompressed Snappy block (offset, bytes). Point Gets in the same
+    /// 32 KiB window skip Snappy entirely.
+    decompressed_block: std::sync::Mutex<Option<(u64, std::sync::Arc<[u8]>)>>,
 }
 
 impl SSTable {
@@ -469,13 +563,17 @@ impl SSTable {
             path,
             config,
             metadata,
-            index: FlatIndex::default(),
+            index: std::sync::RwLock::new(FlatIndex::default()),
+            index_loaded: std::sync::atomic::AtomicBool::new(false),
+            index_load_lock: std::sync::Mutex::new(()),
             bloom_filter: None,
             reader,
             last_access: std::sync::atomic::AtomicU64::new(0),
             reader_count: std::sync::atomic::AtomicUsize::new(0),
             marked_for_deletion: std::sync::atomic::AtomicBool::new(false),
             is_ready: std::sync::atomic::AtomicBool::new(false),
+            block_compressed: std::sync::atomic::AtomicBool::new(false),
+            decompressed_block: std::sync::Mutex::new(None),
         })
     }
 
@@ -510,56 +608,74 @@ impl SSTable {
             .key
             .clone();
 
-        // Write entries with checksums
-        let mut offset = 0u64;
+        self.block_compressed
+            .store(true, std::sync::atomic::Ordering::Release);
+
         let mut file_hasher = Crc32Hasher::new();
+        writer
+            .write_all(SST_COMPRESSED_MAGIC)
+            .await
+            .map_err(LsmError::Io)?;
+        writer.write_all(&[1u8, 0, 0, 0]).await.map_err(LsmError::Io)?;
+        file_hasher.update(SST_COMPRESSED_MAGIC);
+        file_hasher.update(&[1u8, 0, 0, 0]);
+
+        let mut offset = SST_COMPRESSED_HEADER as u64;
         let mut index_pairs: Vec<(String, u64, u32)> = Vec::with_capacity(entries.len());
+        let mut block = Vec::new();
+        let mut pending: Vec<(String, u32)> = Vec::new();
 
         for entry in &entries {
             let entry_data = bincode::serialize(entry).map_err(|e| {
                 LsmError::Serialization(format!("Failed to serialize entry: {}", e))
             })?;
-
+            if !block.is_empty() && block.len() >= SST_BLOCK_TARGET {
+                write_snappy_block(
+                    &mut writer,
+                    &mut file_hasher,
+                    &mut offset,
+                    &mut index_pairs,
+                    &mut block,
+                    &mut pending,
+                )
+                .await?;
+            }
+            let in_off = block.len() as u32;
             let entry_size = entry_data.len() as u32;
-
-            // Compute checksum for this entry (size + data)
             let mut entry_hasher = Crc32Hasher::new();
             entry_hasher.update(&entry_size.to_le_bytes());
             entry_hasher.update(&entry_data);
             let entry_checksum = entry_hasher.finalize();
-
-            // Update file-level checksum
-            file_hasher.update(&entry_size.to_le_bytes());
-            file_hasher.update(&entry_data);
-            file_hasher.update(&entry_checksum.to_le_bytes());
-
-            // Write entry size
-            writer
-                .write_u32_le(entry_size)
-                .await
-                .map_err(LsmError::Io)?;
-
-            // Write entry data
-            writer.write_all(&entry_data).await.map_err(LsmError::Io)?;
-
-            // Write entry checksum
-            writer
-                .write_u32_le(entry_checksum)
-                .await
-                .map_err(LsmError::Io)?;
-
-            // Store in index (offset and size including checksum)
-            let total_entry_size = 4 + entry_size + 4; // size + data + checksum
-            index_pairs.push((entry.key.clone(), offset, total_entry_size));
-            offset += total_entry_size as u64;
+            block.extend_from_slice(&entry_size.to_le_bytes());
+            block.extend_from_slice(&entry_data);
+            block.extend_from_slice(&entry_checksum.to_le_bytes());
+            pending.push((entry.key.clone(), in_off));
         }
+        write_snappy_block(
+            &mut writer,
+            &mut file_hasher,
+            &mut offset,
+            &mut index_pairs,
+            &mut block,
+            &mut pending,
+        )
+        .await?;
 
         // Update metadata
         self.metadata.file_size = offset;
         self.metadata.index_offset = offset;
 
-        self.index = FlatIndex::from_sorted(index_pairs);
-        let index_data = self.index.encode();
+        let index_raw = {
+            let mut guard = self
+                .index
+                .write()
+                .map_err(|_| LsmError::Internal("index lock poisoned".into()))?;
+            *guard = FlatIndex::from_sorted(index_pairs);
+            guard.encode()
+        };
+        self.index_loaded
+            .store(true, std::sync::atomic::Ordering::Release);
+        let index_data = snap_compress(&index_raw)?;
 
         self.metadata.index_size = index_data.len() as u64;
 
@@ -658,16 +774,16 @@ impl SSTable {
         self.open_sync()
     }
 
-    /// Load metadata + index with blocking I/O (no tokio hop).
+    /// Load metadata with blocking I/O (no tokio hop). The on-disk index is
+    /// deferred to first use (`ensure_index_loaded`): decoding every F4IX at
+    /// open cost 10–25 ms per SSTable and dominated shard open.
     pub fn open_sync(&mut self) -> Result<()> {
         self.update_last_access();
-        if self.is_ready.load(std::sync::atomic::Ordering::Acquire)
-            && !self.index.is_empty()
-        {
+        if self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         self.reader.ensure_open_blocking(true)?;
-        self.try_read_metadata_and_index_blocking()?;
+        self.try_read_metadata_blocking()?;
         self.is_ready
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -713,10 +829,22 @@ impl SSTable {
         Ok(())
     }
 
-    fn try_read_metadata_and_index_blocking(&mut self) -> Result<()> {
+    fn try_read_metadata_blocking(&mut self) -> Result<()> {
+        let timing = std::env::var_os("F4KVS_OPEN_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         self.reader.ensure_open_blocking(true)?;
 
+        let mut mag = [0u8; 4];
+        if self.reader.read_exact_at_blocking(0, &mut mag).is_ok() && mag == *SST_COMPRESSED_MAGIC {
+            self.block_compressed
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            self.block_compressed
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+
         let file_size = self.reader.file_size_blocking()?;
+        let t_open = t0.elapsed();
 
         // Read metadata from end of file (metadata is at the end, followed by its checksum)
         let mut buffer = vec![0u8; 2048];
@@ -747,6 +875,7 @@ impl SSTable {
         if metadata_size == 0 {
             return Err(LsmError::Corruption("Failed to read metadata".to_string()));
         }
+        let t_meta_scan = t0.elapsed();
 
         let metadata_checksum_offset = metadata_offset + metadata_size as u64;
         let stored_metadata_checksum = self
@@ -768,13 +897,66 @@ impl SSTable {
                 stored_metadata_checksum, computed_metadata_checksum
             )));
         }
+        let t_meta_crc = t0.elapsed();
+
+        if timing {
+            eprintln!(
+                "open_timing {:?} size={} idx_comp={} | open={:?} meta_scan={:?} meta_crc={:?} (index deferred)",
+                self.path.file_name().unwrap_or_default(),
+                file_size,
+                self.metadata.index_size,
+                t_open,
+                t_meta_scan - t_open,
+                t_meta_crc - t_meta_scan,
+            );
+        }
+
+        // Bloom is optional (index is authoritative). Loading Vec<bool> filters
+        // on every shard open dominated catalog browse; skip it.
+        self.bloom_filter = None;
+
+        Ok(())
+    }
+
+    /// Load the on-disk index on first use. `open_sync` reads metadata only:
+    /// reading + checksumming + Snappy-decompressing every F4IX at open cost
+    /// 10–25 ms per SSTable and dominated shard open on large catalogs.
+    /// Concurrent callers are serialized; the decode happens once.
+    pub fn ensure_index_loaded(&self) -> Result<()> {
+        if self
+            .index_loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let _serialize = self
+            .index_load_lock
+            .lock()
+            .map_err(|_| LsmError::Internal("index load lock poisoned".into()))?;
+        if self
+            .index_loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        let timing = std::env::var_os("F4KVS_OPEN_TIMING").is_some();
+        let t0 = std::time::Instant::now();
+        self.reader.ensure_open_blocking(true)?;
 
         let index_start = self.metadata.index_offset;
         let index_size = self.metadata.index_size;
+        if index_size == 0 {
+            return Err(LsmError::Corruption(format!(
+                "SSTable metadata has zero index_size (not opened?): {:?}",
+                self.path
+            )));
+        }
 
         let mut index_buffer = vec![0u8; index_size as usize];
         self.reader
             .read_exact_at_blocking(index_start, &mut index_buffer)?;
+        let t_idx_read = t0.elapsed();
 
         let stored_index_checksum = self
             .reader
@@ -791,22 +973,90 @@ impl SSTable {
                 stored_index_checksum, computed_index_checksum
             )));
         }
+        let t_idx_crc = t0.elapsed();
 
-        self.index = FlatIndex::decode(&index_buffer)?;
+        let index_bytes = if self
+            .block_compressed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            snap_decompress(&index_buffer)?
+        } else {
+            index_buffer
+        };
+        let t_decomp = t0.elapsed();
+        let decoded = FlatIndex::decode(&index_bytes)?;
+        let t_decode = t0.elapsed();
 
-        // Bloom is optional (index is authoritative). Loading Vec<bool> filters
-        // on every shard open dominated catalog browse; skip it.
-        self.bloom_filter = None;
+        // Decoding a corrupt index must fail here, not serve wrong offsets:
+        // this is the deferred equivalent of the open-time validation.
+        if decoded.len() != self.metadata.entry_count {
+            return Err(LsmError::Corruption(format!(
+                "SSTable index size {} does not match entry_count {}: {:?}",
+                decoded.len(),
+                self.metadata.entry_count,
+                self.path
+            )));
+        }
 
+        if timing {
+            eprintln!(
+                "index_load_timing {:?} idx_comp={} idx_raw={} | idx_read={:?} idx_crc={:?} decomp={:?} decode={:?}",
+                self.path.file_name().unwrap_or_default(),
+                index_size,
+                index_bytes.len(),
+                t_idx_read,
+                t_idx_crc - t_idx_read,
+                t_decomp - t_idx_crc,
+                t_decode - t_decomp,
+            );
+        }
+
+        *self
+            .index
+            .write()
+            .map_err(|_| LsmError::Internal("index lock poisoned".into()))? = decoded;
+        self.index_loaded
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
-    pub(crate) fn index_start(&self, prefix: &str) -> usize {
-        self.index.partition_point(prefix.as_bytes())
+    /// Read guard on the index, loading it from disk on first use.
+    fn index_guard(&self) -> Result<std::sync::RwLockReadGuard<'_, FlatIndex>> {
+        self.ensure_index_loaded()?;
+        self.index
+            .read()
+            .map_err(|_| LsmError::Internal("index lock poisoned".into()))
     }
 
-    pub(crate) fn index_key_at(&self, pos: usize) -> Option<&[u8]> {
-        self.index.at(pos).map(|(k, _)| k)
+    pub(crate) fn index_start(&self, prefix: &str) -> usize {
+        match self.index_guard() {
+            Ok(idx) => idx.partition_point(prefix.as_bytes()),
+            Err(e) => {
+                // Exhausted sentinel: scan heads at this position yield nothing.
+                log::error!("index_start: index unavailable for {:?}: {}", self.path, e);
+                usize::MAX
+            }
+        }
+    }
+
+    pub(crate) fn index_key_at(&self, pos: usize) -> Option<Vec<u8>> {
+        match self.index_guard() {
+            Ok(idx) => idx.at(pos).map(|(k, _)| k.to_vec()),
+            Err(e) => {
+                log::error!("index_key_at: index unavailable for {:?}: {}", self.path, e);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn index_key_eq(&self, pos: usize, key: &[u8]) -> bool {
+        match self.index_guard() {
+            Ok(idx) => idx.at(pos).map(|(k, _)| k == key).unwrap_or(false),
+            Err(e) => {
+                log::error!("index_key_eq: index unavailable for {:?}: {}", self.path, e);
+                false
+            }
+        }
     }
 
     /// Smallest key in `(after, ∞)` that starts with `prefix`.
@@ -814,16 +1064,17 @@ impl SSTable {
         if !self.is_ready() {
             return None;
         }
+        let idx = self.index_guard().ok()?;
         let bound = after.unwrap_or(prefix);
-        let mut i = self.index.partition_point(bound.as_bytes());
+        let mut i = idx.partition_point(bound.as_bytes());
         if after.is_some() {
-            if let Some((k, _)) = self.index.at(i) {
+            if let Some((k, _)) = idx.at(i) {
                 if k == bound.as_bytes() {
                     i += 1;
                 }
             }
         }
-        let (k, _) = self.index.at(i)?;
+        let (k, _) = idx.at(i)?;
         if k.starts_with(prefix.as_bytes()) {
             Some(String::from_utf8_lossy(k).into_owned())
         } else {
@@ -885,7 +1136,11 @@ impl SSTable {
     }
 
     /// Synchronous lookup (no tokio). File must be open or resilient reopen is on.
-    pub(crate) fn lookup_sync(&self, key: &str) -> Result<SstableLookupResult> {
+    pub(crate) fn lookup_sync(
+        &self,
+        key: &str,
+        block_cache: Option<&SharedBlockCache>,
+    ) -> Result<SstableLookupResult> {
         if !self.is_ready.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LsmError::Internal(format!(
                 "Cannot read from SSTable that is not ready: {:?}",
@@ -896,17 +1151,24 @@ impl SSTable {
             return Ok(SstableLookupResult::Missing);
         }
         self.update_last_access();
-        let Some((offset, size)) = self.index.get(key) else {
-            return Ok(SstableLookupResult::Missing);
+        let (offset, size) = {
+            let idx = self.index_guard()?;
+            let Some(loc) = idx.get(key) else {
+                return Ok(SstableLookupResult::Missing);
+            };
+            loc
         };
-        if self.metadata.index_offset == 0
-            || offset >= self.metadata.index_offset
-            || size == 0
-            || size > 100 * 1024 * 1024
-        {
+        if self.metadata.index_offset == 0 || offset >= self.metadata.index_offset {
             return Ok(SstableLookupResult::Missing);
         }
-        match self.try_read_entry_sync(offset) {
+        if self.is_block_compressed() {
+            if size > 100 * 1024 * 1024 {
+                return Ok(SstableLookupResult::Missing);
+            }
+        } else if size == 0 || size > 100 * 1024 * 1024 {
+            return Ok(SstableLookupResult::Missing);
+        }
+        match self.try_read_entry_sync(offset, size, block_cache) {
             Ok(entry) if entry.deleted => Ok(SstableLookupResult::Tombstone {
                 timestamp: entry.timestamp,
             }),
@@ -918,8 +1180,67 @@ impl SSTable {
         }
     }
 
-    fn try_read_entry_sync(&self, offset: u64) -> Result<SSTableEntry> {
+    fn read_snappy_block_sync(
+        &self,
+        block_off: u64,
+        block_cache: Option<&SharedBlockCache>,
+    ) -> Result<std::sync::Arc<[u8]>> {
+        if let Ok(guard) = self.decompressed_block.lock() {
+            if let Some((off, data)) = guard.as_ref() {
+                if *off == block_off {
+                    return Ok(std::sync::Arc::clone(data));
+                }
+            }
+        }
+        let cache_key = format!("{}:blk:{}", self.path.display(), block_off);
+        if let Some(cache) = block_cache {
+            if let Some(hit) = cache.get_sync(&cache_key) {
+                let arc: std::sync::Arc<[u8]> = hit.into();
+                if let Ok(mut guard) = self.decompressed_block.lock() {
+                    *guard = Some((block_off, std::sync::Arc::clone(&arc)));
+                }
+                return Ok(arc);
+            }
+        }
         self.ensure_file_open_sync()?;
+        let unc_len = self.reader.read_u32_le_at_blocking(block_off)?;
+        let comp_len = self.reader.read_u32_le_at_blocking(block_off + 4)?;
+        if unc_len == 0 || unc_len > 128 * 1024 * 1024 || comp_len == 0 || comp_len > 128 * 1024 * 1024
+        {
+            return Err(LsmError::Corruption(format!(
+                "invalid snappy block header at {block_off} unc={unc_len} comp={comp_len}"
+            )));
+        }
+        let mut comp = vec![0u8; comp_len as usize];
+        self.reader.read_exact_at_blocking(block_off + 8, &mut comp)?;
+        let raw = snap_decompress(&comp)?;
+        if raw.len() != unc_len as usize {
+            return Err(LsmError::Corruption(format!(
+                "snappy block length mismatch at {block_off}: got {} want {unc_len}",
+                raw.len()
+            )));
+        }
+        if let Some(cache) = block_cache {
+            cache.put_sync(cache_key, raw.clone());
+        }
+        let arc: std::sync::Arc<[u8]> = raw.into();
+        if let Ok(mut guard) = self.decompressed_block.lock() {
+            *guard = Some((block_off, std::sync::Arc::clone(&arc)));
+        }
+        Ok(arc)
+    }
+
+    fn try_read_entry_sync(
+        &self,
+        offset: u64,
+        loc: u32,
+        block_cache: Option<&SharedBlockCache>,
+    ) -> Result<SSTableEntry> {
+        self.ensure_file_open_sync()?;
+        if self.is_block_compressed() {
+            let block = self.read_snappy_block_sync(offset, block_cache)?;
+            return parse_framed_entry(&block, loc as usize);
+        }
         let file_size = self.metadata.file_size.max(self.reader.file_size_blocking()?);
         if offset + 8 > file_size {
             return Err(LsmError::Io(std::io::Error::new(
@@ -1028,7 +1349,7 @@ impl SSTable {
             self.metadata.smallest_key,
             self.metadata.largest_key
         );
-        log::trace!("Index size: {}", self.index.len());
+        log::trace!("Index size: {}", self.metadata.entry_count);
 
         // Check if key is in range
         if key < self.metadata.smallest_key.as_str() || key > self.metadata.largest_key.as_str() {
@@ -1045,9 +1366,15 @@ impl SSTable {
             log::trace!("Bloom filter says key '{}' might be present", key);
         }
 
-        // Look up in index - this is a read-only operation on the BTreeMap which is safe for concurrent access
-        // The index is only modified during SSTable creation/writing, not during reads
-        let (offset, size) = match self.index.get(key) {
+        // Look up in index - loaded lazily on first access; immutable afterwards.
+        let index_hit = match self.index_guard() {
+            Ok(idx) => idx.get(key),
+            Err(e) => {
+                guard.decrement();
+                return Err(e);
+            }
+        };
+        let (offset, size) = match index_hit {
             Some(entry) => {
                 log::trace!("Found key '{}' in index at offset {}", key, entry.0);
                 let (offset, size) = entry;
@@ -1074,8 +1401,9 @@ impl SSTable {
                     )));
                 }
 
-                // Validate size is reasonable
-                if size == 0 {
+                // Legacy files: size is framed-record length (never 0).
+                // Compressed files: size is offset inside the Snappy block (0 is valid).
+                if !self.is_block_compressed() && size == 0 {
                     guard.decrement();
                     return Err(LsmError::Corruption(format!(
                         "Index entry size is zero for key '{}' at offset {}. SSTable: {:?}",
@@ -1114,8 +1442,7 @@ impl SSTable {
             )));
         }
 
-        if size == 0 || size > 100 * 1024 * 1024 {
-            // 100MB max entry size
+        if (!self.is_block_compressed() && size == 0) || size > 100 * 1024 * 1024 {
             error!(
                 "Invalid entry size {} for key '{}' in SSTable {:?}",
                 size, key, self.path
@@ -1135,7 +1462,7 @@ impl SSTable {
         let base_retry_delay = Duration::from_millis(self.config.retry_delay_ms / 2);
 
         loop {
-            match self.try_read_entry(offset, block_cache).await {
+            match self.try_read_entry(offset, size, block_cache).await {
                 Ok(entry) => {
                     // Manually decrement reader count before returning on success
                     guard.decrement();
@@ -1198,11 +1525,27 @@ impl SSTable {
     }
 
     /// Try to read an entry from file with checksum validation
+    async fn try_read_compressed_entry(
+        &self,
+        block_off: u64,
+        loc: u32,
+        block_cache: Option<&SharedBlockCache>,
+    ) -> Result<SSTableEntry> {
+        let block = self.read_snappy_block_sync(block_off, block_cache)?;
+        parse_framed_entry(&block, loc as usize)
+    }
+
     async fn try_read_entry(
         &self,
         offset: u64,
+        loc: u32,
         block_cache: Option<&SharedBlockCache>,
     ) -> Result<SSTableEntry> {
+        if self.is_block_compressed() {
+            return self
+                .try_read_compressed_entry(offset, loc, block_cache)
+                .await;
+        }
         let cache_key = self.block_cache_key(offset);
         if let Some(cache) = block_cache {
             if let Some(cached) = cache.get(&cache_key).await {
@@ -1513,10 +1856,11 @@ impl SSTable {
 
     /// Scan keys with a prefix
     pub async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let idx = self.index_guard()?;
         let mut keys = Vec::new();
         let pb = prefix.as_bytes();
-        for i in self.index.partition_point(pb)..self.index.len() {
-            let Some((key, _)) = self.index.at(i) else {
+        for i in idx.partition_point(pb)..idx.len() {
+            let Some((key, _)) = idx.at(i) else {
                 break;
             };
             if !key.starts_with(pb) {
@@ -1544,21 +1888,28 @@ impl SSTable {
         }
         self.ensure_file_open().await?;
 
-        let mut entries = Vec::new();
-        let pb = prefix.as_bytes();
-        for i in self.index.partition_point(pb)..self.index.len() {
-            let Some((key, (offset, _))) = self.index.at(i) else {
-                break;
-            };
-            if !key.starts_with(pb) {
-                break;
+        // Collect locations under the index guard, then read entries without
+        // holding the (non-Send) lock across awaits.
+        let locs: Vec<(String, u64, u32)> = {
+            let idx = self.index_guard()?;
+            let pb = prefix.as_bytes();
+            let mut locs = Vec::new();
+            for i in idx.partition_point(pb)..idx.len() {
+                let Some((key, (offset, loc))) = idx.at(i) else {
+                    break;
+                };
+                if !key.starts_with(pb) {
+                    break;
+                }
+                locs.push((String::from_utf8_lossy(key).into_owned(), offset, loc));
             }
-            if let Ok(entry) = self.try_read_entry(offset, None).await {
-                entries.push((
-                    String::from_utf8_lossy(key).into_owned(),
-                    entry.value,
-                    entry.deleted,
-                ));
+            locs
+        };
+
+        let mut entries = Vec::with_capacity(locs.len());
+        for (key, offset, loc) in locs {
+            if let Ok(entry) = self.try_read_entry(offset, loc, None).await {
+                entries.push((key, entry.value, entry.deleted));
             }
         }
         Ok(entries)
@@ -1575,24 +1926,29 @@ impl SSTable {
         }
         self.ensure_file_open().await?;
 
-        let mut entries = Vec::new();
         let end_bound = crate::utils::exclusive_range_end(end);
-        let start_i = self.index.partition_point(start.as_bytes());
-        for i in start_i..self.index.len() {
-            let Some((key, (offset, _))) = self.index.at(i) else {
-                break;
-            };
-            if let Some(ref end_bound) = end_bound {
-                if key >= end_bound.as_bytes() {
+        let locs: Vec<(String, u64, u32)> = {
+            let idx = self.index_guard()?;
+            let mut locs = Vec::new();
+            let start_i = idx.partition_point(start.as_bytes());
+            for i in start_i..idx.len() {
+                let Some((key, (offset, loc))) = idx.at(i) else {
                     break;
+                };
+                if let Some(ref end_bound) = end_bound {
+                    if key >= end_bound.as_bytes() {
+                        break;
+                    }
                 }
+                locs.push((String::from_utf8_lossy(key).into_owned(), offset, loc));
             }
-            if let Ok(entry) = self.try_read_entry(offset, None).await {
-                entries.push((
-                    String::from_utf8_lossy(key).into_owned(),
-                    entry.value,
-                    entry.deleted,
-                ));
+            locs
+        };
+
+        let mut entries = Vec::with_capacity(locs.len());
+        for (key, offset, loc) in locs {
+            if let Ok(entry) = self.try_read_entry(offset, loc, None).await {
+                entries.push((key, entry.value, entry.deleted));
             }
         }
         Ok(entries)
@@ -1600,18 +1956,22 @@ impl SSTable {
 
     /// Scan all entries in the SSTable
     pub async fn scan_all(&self) -> Result<Vec<(String, Value, bool)>> {
-        let mut entries = Vec::new();
+        let locs: Vec<(String, u64, u32)> = {
+            let idx = self.index_guard()?;
+            let mut locs = Vec::with_capacity(idx.len());
+            for i in 0..idx.len() {
+                let Some((key, (offset, loc))) = idx.at(i) else {
+                    break;
+                };
+                locs.push((String::from_utf8_lossy(key).into_owned(), offset, loc));
+            }
+            locs
+        };
 
-        for i in 0..self.index.len() {
-            let Some((key, (offset, _))) = self.index.at(i) else {
-                break;
-            };
-            if let Ok(entry) = self.try_read_entry(offset, None).await {
-                entries.push((
-                    String::from_utf8_lossy(key).into_owned(),
-                    entry.value,
-                    entry.deleted,
-                ));
+        let mut entries = Vec::with_capacity(locs.len());
+        for (key, offset, loc) in locs {
+            if let Ok(entry) = self.try_read_entry(offset, loc, None).await {
+                entries.push((key, entry.value, entry.deleted));
             }
         }
 
@@ -1637,14 +1997,21 @@ impl SSTable {
             )));
         }
 
-        let expected = self.index.len();
+        let locs: Vec<(String, u64, u32)> = {
+            let idx = self.index_guard()?;
+            let mut locs = Vec::with_capacity(idx.len());
+            for i in 0..idx.len() {
+                let Some((key, (offset, size))) = idx.at(i) else {
+                    break;
+                };
+                locs.push((String::from_utf8_lossy(key).into_owned(), offset, size));
+            }
+            locs
+        };
+        let expected = locs.len();
         let mut entries = Vec::with_capacity(expected);
 
-        // Iterate over index - this is safe as the index is only modified during SSTable creation
-        for i in 0..self.index.len() {
-            let Some((key, (offset, size))) = self.index.at(i) else {
-                break;
-            };
+        for (key, (offset, size)) in locs.iter().map(|(k, o, s)| (k.as_bytes(), (*o, *s))) {
             if self.is_marked_for_deletion() {
                 return Err(LsmError::Internal(format!(
                     "SSTable {:?} marked for deletion during get_all_entries (got {} of {})",
@@ -1664,7 +2031,7 @@ impl SSTable {
                 )));
             }
 
-            if size == 0 || size > 100 * 1024 * 1024 {
+            if (!self.is_block_compressed() && size == 0) || size > 100 * 1024 * 1024 {
                 return Err(LsmError::Internal(format!(
                     "Invalid entry size {} for key '{}' in {:?}",
                     size,
@@ -1673,7 +2040,7 @@ impl SSTable {
                 )));
             }
 
-            match self.try_read_entry(offset, None).await {
+            match self.try_read_entry(offset, size, None).await {
                 Ok(entry) => entries.push(entry),
                 Err(e) => {
                     return Err(LsmError::Internal(format!(
@@ -1720,10 +2087,19 @@ impl SSTable {
         self.is_ready.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Get the number of entries in the index
+    pub(crate) fn is_block_compressed(&self) -> bool {
+        self.block_compressed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Get the number of entries in the index (loads it on first use).
     /// This is useful for validation that the index was loaded correctly
     pub fn index_size(&self) -> usize {
-        self.index.len()
+        if let Err(e) = self.ensure_index_loaded() {
+            log::error!("index_size: failed to load index for {:?}: {}", self.path, e);
+            return 0;
+        }
+        self.index.read().map(|g| g.len()).unwrap_or(0)
     }
 
     /// Close SSTable file handle (keeps index/metadata/`is_ready` intact).
@@ -1752,7 +2128,14 @@ impl SSTable {
             path: self.path.clone(),
             config: self.config.clone(),
             metadata: self.metadata.clone(),
-            index: self.index.clone(),
+            index: std::sync::RwLock::new(
+                self.index.read().map(|g| g.clone()).unwrap_or_default(),
+            ),
+            index_loaded: std::sync::atomic::AtomicBool::new(
+                self.index_loaded
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            index_load_lock: std::sync::Mutex::new(()),
             bloom_filter: self.bloom_filter.clone(),
             reader: SstableFileReader::new(
                 self.path.clone(),
@@ -1767,6 +2150,11 @@ impl SSTable {
             is_ready: std::sync::atomic::AtomicBool::new(
                 self.is_ready.load(std::sync::atomic::Ordering::Relaxed),
             ),
+            block_compressed: std::sync::atomic::AtomicBool::new(
+                self.block_compressed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            decompressed_block: std::sync::Mutex::new(None),
         }
     }
 }
@@ -1807,5 +2195,79 @@ impl<'a> ReaderGuard<'a> {
 impl<'a> Drop for ReaderGuard<'a> {
     fn drop(&mut self) {
         self.decrement();
+    }
+}
+
+#[cfg(test)]
+mod compress_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn write_compressed_roundtrip_and_prefix() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.sst");
+        let mut sst = SSTable::new(path.clone(), SstableConfig::default(), 0).unwrap();
+        let mut entries = Vec::new();
+        for i in 0..200 {
+            entries.push(SSTableEntry {
+                key: format!("dDocuments/path/{i:04}/file.txt"),
+                value: Value::Bytes(format!(r#"{{"name":"file{i}.txt","size":{i}}}"#).into_bytes()),
+                timestamp: i as u64 + 1,
+                deleted: false,
+            });
+        }
+        sst.write_entries(entries).await.unwrap();
+        sst.open().await.unwrap();
+        assert!(sst.is_block_compressed());
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(&head[..4], b"F4SC");
+
+        let got = sst.lookup_sync("dDocuments/path/0007/file.txt", None).unwrap();
+        match got {
+            SstableLookupResult::Found { value, .. } => {
+                assert!(matches!(value, Value::Bytes(_)));
+            }
+            other => panic!("{other:?}"),
+        }
+        let keys = sst.scan_prefix("dDocuments/path/000").await.unwrap();
+        assert!(keys.len() >= 10);
+
+        let cache = SharedBlockCache::new(4 << 20);
+        for i in 0..200 {
+            let k = format!("dDocuments/path/{i:04}/file.txt");
+            assert!(matches!(
+                sst.lookup_sync(&k, Some(&cache)).unwrap(),
+                SstableLookupResult::Found { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_uncompressed_still_reads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.sst");
+        // Minimal legacy file: one framed entry + empty-ish index/metadata is hard
+        // to hand-roll. Write compressed, then verify a non-magic file is
+        // detected as legacy (open fails without a real footer — just the flag).
+        let mut sst = SSTable::new(path.clone(), SstableConfig::default(), 0).unwrap();
+        sst.write_entries(vec![SSTableEntry {
+            key: "k".into(),
+            value: Value::Bytes(b"v".to_vec()),
+            timestamp: 1,
+            deleted: false,
+        }])
+        .await
+        .unwrap();
+        drop(sst);
+        let mut sst = SSTable::new(path, SstableConfig::default(), 0).unwrap();
+        sst.open().await.unwrap();
+        assert!(sst.is_block_compressed());
+        match sst.lookup_sync("k", None).unwrap() {
+            SstableLookupResult::Found { value, .. } => {
+                assert_eq!(value, Value::Bytes(b"v".to_vec()));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

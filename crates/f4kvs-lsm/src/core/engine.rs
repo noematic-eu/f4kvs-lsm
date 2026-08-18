@@ -199,17 +199,33 @@ impl PrefixScanState {
 impl LsmTreeEngine {
     /// Create a new LSM tree engine
     pub async fn new(config: LsmConfig) -> Result<Self> {
+        let timing = std::env::var_os("F4KVS_OPEN_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         // Create necessary directories
         Self::create_directories(&config).await?;
+        let t1 = t0.elapsed();
 
         // Create engine structure
         let engine = Self::create_engine_structure(config).await?;
+        let t2 = t0.elapsed();
 
         // Initialize components
         engine.initialize_components().await?;
+        let t3 = t0.elapsed();
 
         // Start background tasks
         engine.start_background_tasks().await?;
+        let t4 = t0.elapsed();
+
+        if timing {
+            eprintln!(
+                "engine_new_timing: create_dirs={:?} structure={:?} init_components={:?} bg_tasks={:?}",
+                t1,
+                t2 - t1,
+                t3 - t2,
+                t4 - t3
+            );
+        }
 
         Ok(engine)
     }
@@ -410,7 +426,7 @@ impl LsmTreeEngine {
             for idx in candidates {
                 let sstable = &level_sstables[idx];
                 sstable.pin_reader();
-                let hit = sstable.lookup_sync(key);
+                let hit = sstable.lookup_sync(key, Some(&self.block_cache));
                 sstable.unpin_reader();
                 match hit {
                     Ok(SstableLookupResult::Missing) => {}
@@ -488,7 +504,7 @@ impl LsmTreeEngine {
                 continue;
             };
             let mut i = sstable.index_start(after);
-            if sstable.index_key_at(i) == Some(after.as_bytes()) {
+            if sstable.index_key_eq(i, after.as_bytes()) {
                 i += 1;
             }
             *pos = i;
@@ -542,7 +558,7 @@ impl LsmTreeEngine {
                     continue;
                 };
                 if let Some(k) = sstable.index_key_at(*pos) {
-                    consider(&mut best, String::from_utf8_lossy(k).into_owned());
+                    consider(&mut best, String::from_utf8_lossy(&k).into_owned());
                 }
             }
         }
@@ -570,7 +586,7 @@ impl LsmTreeEngine {
             let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
                 continue;
             };
-            if sstable.index_key_at(*pos) == Some(key.as_bytes()) {
+            if sstable.index_key_eq(*pos, key.as_bytes()) {
                 *pos += 1;
             }
         }
@@ -594,10 +610,10 @@ impl LsmTreeEngine {
             let Some(sstable) = sstables.get(level).and_then(|f| f.get(*idx)) else {
                 continue;
             };
-            if sstable.index_key_at(*pos) != Some(key.as_bytes()) {
+            if !sstable.index_key_eq(*pos, key.as_bytes()) {
                 continue;
             }
-            match sstable.lookup_sync(key) {
+            match sstable.lookup_sync(key, Some(&self.block_cache)) {
                 Ok(SstableLookupResult::Missing) => {}
                 Ok(hit) => {
                     let ts = match &hit {
@@ -722,15 +738,71 @@ impl LsmTreeEngine {
 
     /// Initialize all engine components
     async fn initialize_components(&self) -> Result<()> {
+        let timing = std::env::var_os("F4KVS_OPEN_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         // Initialize WAL if enabled
         self.initialize_wal().await?;
+        let t1 = t0.elapsed();
 
         // Load existing SSTables from disk
         self.load_existing_sstables().await?;
+        let t2 = t0.elapsed();
+
+        self.spawn_index_warmup();
 
         self.refresh_live_key_count().await?;
+        let t3 = t0.elapsed();
+
+        if timing {
+            eprintln!(
+                "init_components_timing: wal={:?} load_sstables={:?} live_count={:?}",
+                t1,
+                t2 - t1,
+                t3 - t2
+            );
+        }
 
         Ok(())
+    }
+
+    /// Warm lazy SSTable indexes in the background so the first Gets after
+    /// open don't pay the full F4IX decode inline (open itself stays
+    /// metadata-only). One blocking task per SSTable; each re-acquires the
+    /// lock briefly so flush/compaction installs are not stalled.
+    fn spawn_index_warmup(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let sstables = Arc::clone(&self.sstables);
+        let shutdown = Arc::clone(&self.shutdown);
+        handle.spawn(async move {
+            let coords: Vec<(usize, usize)> = {
+                let guard = sstables.read().await;
+                guard
+                    .iter()
+                    .flat_map(|(&level, files)| (0..files.len()).map(move |idx| (level, idx)))
+                    .collect()
+            };
+            let mut tasks = Vec::with_capacity(coords.len());
+            for (level, idx) in coords {
+                let sstables = Arc::clone(&sstables);
+                let shutdown = Arc::clone(&shutdown);
+                tasks.push(tokio::task::spawn_blocking(move || {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let guard = sstables.blocking_read();
+                    if let Some(sst) = guard.get(&level).and_then(|f| f.get(idx)) {
+                        if let Err(e) = sst.ensure_index_loaded() {
+                            warn!("index warmup failed for {:?}: {}", sst.path(), e);
+                        }
+                    }
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
     }
 
     /// Initialize WAL and perform recovery if needed
@@ -748,6 +820,7 @@ impl LsmTreeEngine {
             }
 
             info!("Attempting WAL recovery from on-disk segments...");
+            let t_wal = std::time::Instant::now();
             match self.recover_from_wal().await {
                 Ok(()) => {
                     info!("WAL recovery completed successfully");
@@ -774,11 +847,19 @@ impl LsmTreeEngine {
             }
 
             info!("Initializing WAL for new writes...");
+            let d_wal_recover = t_wal.elapsed();
             {
                 let wal = self.wal_manager.write().await;
                 wal.initialize()
                     .await
                     .map_err(|e| LsmError::Wal(format!("Failed to initialize WAL: {}", e)))?;
+            }
+            if std::env::var_os("F4KVS_OPEN_TIMING").is_some() {
+                eprintln!(
+                    "wal_timing: recover={:?} initialize={:?}",
+                    d_wal_recover,
+                    t_wal.elapsed() - d_wal_recover
+                );
             }
             info!("WAL initialized");
         } else {
@@ -832,6 +913,7 @@ impl LsmTreeEngine {
         }
 
         let sst_cfg = self.config.sstable.clone();
+        let t_open = std::time::Instant::now();
         let opened: Vec<(usize, Result<SSTable>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = jobs
                 .into_iter()
@@ -857,6 +939,7 @@ impl LsmTreeEngine {
                 .map(|h| h.join().expect("sstable open thread"))
                 .collect()
         });
+        let d_parallel_open = t_open.elapsed();
 
         let mut sstables = self.sstables.write().await;
         for (level, result) in opened {
@@ -866,6 +949,20 @@ impl LsmTreeEngine {
                     loaded_count += 1;
                 }
                 Err(_) => failed_count += 1,
+            }
+        }
+        for (level, files) in sstables.iter_mut() {
+            if *level > 0 {
+                files.sort_by(|a, b| {
+                    a.metadata()
+                        .largest_key
+                        .cmp(&b.metadata().largest_key)
+                        .then_with(|| {
+                            a.metadata()
+                                .smallest_key
+                                .cmp(&b.metadata().smallest_key)
+                        })
+                });
             }
         }
 
@@ -910,15 +1007,16 @@ impl LsmTreeEngine {
                 }
             }
         }
-        let seq_file_hw = self.load_sequence_file().await.unwrap_or(0);
-        let high_water = max_flush_seq.max(max_entry_ts).max(seq_file_hw);
+        let seq_file_next = self.load_sequence_file().await.unwrap_or(0);
+        // SEQUENCE stores the *next* id to assign (see persist_sequence_high_water).
+        // Folding the file into high_water then adding 1 rewrote next+1 on every
+        // open (~10 ms fsync × N shards). Resume at max(scan+1, file).
+        let scan_next = max_flush_seq.max(max_entry_ts).saturating_add(1);
+        let next = scan_next.max(seq_file_next);
 
-        if high_water > 0 || loaded_count > 0 {
-            let next = high_water.saturating_add(1);
+        if next > 0 || loaded_count > 0 {
             self.sequence_number.store(next, Ordering::SeqCst);
-            // Rewrite SEQUENCE only when the watermark moved. Every open used
-            // to fsync the same value (~10ms × N shards on catalog browse).
-            if next > seq_file_hw {
+            if next > seq_file_next {
                 if let Err(e) = self.persist_sequence_file(next).await {
                     warn!("Failed to persist SEQUENCE high-water mark: {}", e);
                 }
@@ -932,6 +1030,13 @@ impl LsmTreeEngine {
         }
         log::debug!("===========================");
 
+        if std::env::var_os("F4KVS_OPEN_TIMING").is_some() {
+            eprintln!(
+                "load_sstables_timing: parallel_open={:?} post={:?}",
+                d_parallel_open,
+                t_open.elapsed() - d_parallel_open
+            );
+        }
         info!("Loaded {} existing SSTables from disk", loaded_count);
         Ok(())
     }
@@ -6660,5 +6765,117 @@ mod tests {
         );
         let got = engine.get("k0").await.expect("get");
         assert!(got.is_some(), "oldest key must survive file GC");
+    }
+
+    /// Manual compact() must merge L0 even when max_sstables_per_level is
+    /// raised to skip background compact (the nmckvs / bulk-ingest setting).
+    #[tokio::test]
+    async fn compact_all_merges_l0_despite_high_file_limit() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().to_path_buf();
+        let config = LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            levels: LevelConfig {
+                max_sstables_per_level: 1_000_000,
+                ..Default::default()
+            },
+            compaction: CompactionConfig {
+                background_enabled: false,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        };
+
+        let engine = LsmTreeEngine::new(config).await.expect("engine");
+        engine.set_bulk_import(true);
+        const N: usize = 8;
+        for i in 0..N {
+            engine
+                .put(
+                    &format!("k{i}"),
+                    &Value::Bytes(format!("v{i}").into_bytes()),
+                )
+                .await
+                .expect("put");
+            engine.flush().await.expect("flush");
+        }
+        engine.set_bulk_import(false);
+
+        let l0_before = {
+            let sstables = engine.sstables.read().await;
+            sstables.get(&0).map(|v| v.len()).unwrap_or(0)
+        };
+        assert!(
+            l0_before >= 6,
+            "need several L0 files before compact; got {l0_before}"
+        );
+
+        engine.compact_all().await.expect("compact_all");
+
+        let (l0_after, l1_after) = {
+            let sstables = engine.sstables.read().await;
+            (
+                sstables.get(&0).map(|v| v.len()).unwrap_or(0),
+                sstables.get(&1).map(|v| v.len()).unwrap_or(0),
+            )
+        };
+        assert_eq!(
+            l0_after, 0,
+            "compact_all must drain L0 into L1 (had {l0_before} L0)"
+        );
+        assert!(
+            l1_after >= 1,
+            "compact_all must install L1 (got {l1_after})"
+        );
+
+        for i in 0..N {
+            let got = engine.get(&format!("k{i}")).await.expect("get");
+            assert_eq!(
+                got,
+                Some(Value::Bytes(format!("v{i}").into_bytes())),
+                "key k{i} must survive compact"
+            );
+        }
+
+        engine.shutdown().await.expect("shutdown");
+        let engine = LsmTreeEngine::new(LsmConfig {
+            data_dir: data_dir.clone(),
+            wal: WalConfig {
+                enabled: true,
+                dir: data_dir.join("wal"),
+                segment_size: 1024 * 1024,
+                ..Default::default()
+            },
+            levels: LevelConfig {
+                max_sstables_per_level: 1_000_000,
+                ..Default::default()
+            },
+            compaction: CompactionConfig {
+                background_enabled: false,
+                ..Default::default()
+            },
+            ..LsmConfig::default()
+        })
+        .await
+        .expect("reopen");
+        let l1_reload = {
+            let sstables = engine.sstables.read().await;
+            sstables.get(&1).map(|v| v.len()).unwrap_or(0)
+        };
+        assert!(l1_reload >= 1, "L1 must reload after compact");
+        for i in 0..N {
+            let got = engine.get(&format!("k{i}")).await.expect("get after reopen");
+            assert_eq!(
+                got,
+                Some(Value::Bytes(format!("v{i}").into_bytes())),
+                "key k{i} must survive compact+reopen"
+            );
+        }
     }
 }
