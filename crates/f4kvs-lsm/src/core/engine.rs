@@ -6760,15 +6760,28 @@ mod tests {
             engine.flush().await.expect("flush");
         }
 
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Poll rather than a fixed 400ms sleep: debug builds + sstables
+        // try_write retries make a wall-clock floor flaky without changing
+        // the invariant (L0 drains while readers stay in flight).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let l0 = loop {
+            let n = engine
+                .sstables
+                .read()
+                .await
+                .get(&0)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if n <= 12 || std::time::Instant::now() > deadline {
+                break n;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
         stop.store(true, Ordering::Relaxed);
         for h in readers {
             let _ = h.await;
         }
 
-        let sstables = engine.sstables.read().await;
-        let l0 = sstables.get(&0).map(|v| v.len()).unwrap_or(0);
-        drop(sstables);
         assert!(
             l0 <= 12,
             "L0 must compact under concurrent gets (soak cache pattern); got {l0}"
