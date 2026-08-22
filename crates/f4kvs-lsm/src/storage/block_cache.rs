@@ -228,23 +228,17 @@ impl SharedBlockCache {
 
     /// Get cache statistics
     pub async fn stats(&self) -> CacheStats {
-        self.cache
-            .lock()
-            .map(|c| c.stats())
-            .unwrap_or(CacheStats {
-                current_size: 0,
-                max_size: 0,
-                block_count: 0,
-                hit_rate: 0.0,
-            })
+        self.cache.lock().map(|c| c.stats()).unwrap_or(CacheStats {
+            current_size: 0,
+            max_size: 0,
+            block_count: 0,
+            hit_rate: 0.0,
+        })
     }
 
     /// Export counters for storage stats.
     pub async fn metrics(&self) -> BlockCacheMetrics {
-        self.cache
-            .lock()
-            .map(|c| c.metrics())
-            .unwrap_or_default()
+        self.cache.lock().map(|c| c.metrics()).unwrap_or_default()
     }
 
     /// Clear the cache

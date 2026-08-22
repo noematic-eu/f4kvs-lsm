@@ -85,8 +85,7 @@ impl FlatIndex {
 
     pub fn encode(&self) -> Vec<u8> {
         let n = self.rec_off.len() as u32;
-        let mut out =
-            Vec::with_capacity(9 + self.rec_off.len() * 4 + self.data.len());
+        let mut out = Vec::with_capacity(9 + self.rec_off.len() * 4 + self.data.len());
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
         out.extend_from_slice(&n.to_le_bytes());
@@ -119,7 +118,9 @@ fn decode_v1(buf: &[u8]) -> Result<FlatIndex> {
     let table = 9;
     let records = table + count * 4;
     if buf.len() < records {
-        return Err(LsmError::Serialization("truncated F4IX offset table".into()));
+        return Err(LsmError::Serialization(
+            "truncated F4IX offset table".into(),
+        ));
     }
     let mut rec_off = Vec::with_capacity(count);
     for i in 0..count {

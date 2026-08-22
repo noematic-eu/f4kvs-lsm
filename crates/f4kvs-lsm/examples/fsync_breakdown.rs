@@ -42,7 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine.put(key, &payload).await?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("memtable_only (wal disabled): {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "memtable_only (wal disabled): {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     // WAL sync None
@@ -56,7 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine.put(key, &payload).await?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("wal_sync_none:            {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "wal_sync_none:            {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     // WAL sync Flush (no fsync)
@@ -70,7 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine.put(key, &payload).await?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("wal_sync_flush:           {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "wal_sync_flush:           {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     // default Fsync (segment WAL)
@@ -82,7 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine.put(key, &payload).await?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("wal_sync_fsync (segment): {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "wal_sync_fsync (segment): {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     // WAL v2 indexed (per-frame micro-files)
@@ -97,7 +109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine.put(key, &payload).await?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("wal_sync_fsync (indexed): {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "wal_sync_fsync (indexed): {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     // raw append + fsync (no bincode/LSM)
@@ -117,7 +132,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             file.sync_all()?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("raw_append+sync_all:      {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "raw_append+sync_all:      {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     // raw append + fdatasync via std (macOS: sync_data)
@@ -137,7 +155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             file.sync_data()?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("raw_append+sync_data:     {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "raw_append+sync_data:     {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     Ok(())

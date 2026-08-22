@@ -220,11 +220,10 @@ impl SstableFileReader {
                     .clone()
                     .ok_or_else(|| LsmError::Internal("Mmap reader not open".to_string()))?;
                 let len = buf.len();
-                let data =
-                    tokio::task::spawn_blocking(move || read_at_mmap(&reader, offset, len))
-                        .await
-                        .map_err(|e| LsmError::Internal(format!("spawn_blocking failed: {e}")))?
-                        .map_err(LsmError::Io)?;
+                let data = tokio::task::spawn_blocking(move || read_at_mmap(&reader, offset, len))
+                    .await
+                    .map_err(|e| LsmError::Internal(format!("spawn_blocking failed: {e}")))?
+                    .map_err(LsmError::Io)?;
                 let n = data.len().min(buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
                 Ok(n)

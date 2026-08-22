@@ -189,20 +189,32 @@ impl CompactionManager {
             debug!("Skipping compaction — already in progress");
             return Ok(());
         }
-        let result = self.compact_if_needed_inner(sstables).await;
+        // Install first, then drop `compacting` *before* wait_for_readers.
+        // After pin-sharing (19ccd74) reclaim can wait up to 5s for live Gets;
+        // holding the flag across that wait skipped every post-flush merge and
+        // L0 piled up under the soak-cache pattern (comfort 20260819T052358Z).
+        let reclaim = self.compact_if_needed_inner(sstables).await;
         self.compacting.store(false, Ordering::Release);
-        result
+        match reclaim {
+            Ok(to_reclaim) => {
+                if !to_reclaim.is_empty() {
+                    self.reclaim_compacted_inputs(&to_reclaim).await;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn compact_if_needed_inner(
         &self,
         sstables: &Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
-    ) -> Result<()> {
+    ) -> Result<Vec<SSTable>> {
         // Check if we should schedule compaction based on resource availability
         if let Some(adaptive_manager) = &self.adaptive_manager {
             if !adaptive_manager.should_schedule_compaction().await {
                 info!("Skipping compaction due to high resource utilization");
-                return Ok(());
+                return Ok(Vec::new());
             }
         }
 
@@ -230,7 +242,7 @@ impl CompactionManager {
         // If no compaction needed, return early without acquiring write lock
         let level = match level_to_compact {
             Some(level) => level,
-            None => return Ok(()),
+            None => return Ok(Vec::new()),
         };
 
         info!("Compacting level {}", level);
@@ -267,7 +279,7 @@ impl CompactionManager {
                             "Skipping compaction for level {} - could not acquire lock within timeout",
                             level
                         );
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                 }
             }
@@ -283,7 +295,7 @@ impl CompactionManager {
             .await
         {
             debug!("Level {} no longer needs compaction, skipping", level);
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Clone SSTables we need for compaction BEFORE releasing the lock
@@ -332,7 +344,7 @@ impl CompactionManager {
                         // compact_level no longer unlinks inputs before install.
                         // Leave the in-memory index on the original files.
                         warn!("Could not acquire lock to update SSTables after compaction; keeping inputs");
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                 }
             }
@@ -352,8 +364,7 @@ impl CompactionManager {
 
         let mut merged = new_sstables;
         merged.extend(concurrent);
-        let kept: std::collections::HashSet<_> =
-            merged.iter().map(|s| s.path().clone()).collect();
+        let kept: std::collections::HashSet<_> = merged.iter().map(|s| s.path().clone()).collect();
         let to_reclaim: Vec<SSTable> = all_sstables
             .get(&level)
             .cloned()
@@ -363,9 +374,7 @@ impl CompactionManager {
             .collect();
         sstables_guard.insert(level, merged);
         drop(sstables_guard);
-        self.reclaim_compacted_inputs(&to_reclaim).await;
-
-        Ok(())
+        Ok(to_reclaim)
     }
 
     /// Manual / FFI compact: drain overlapping L0 into range-partitioned L1.
@@ -387,8 +396,12 @@ impl CompactionManager {
         let (valid_l0, valid_l1) = {
             let guard = sstables.read().await;
             (
-                Self::valid_sstables_for_compact(guard.get(&0).map(|v| v.as_slice()).unwrap_or(&[])),
-                Self::valid_sstables_for_compact(guard.get(&1).map(|v| v.as_slice()).unwrap_or(&[])),
+                Self::valid_sstables_for_compact(
+                    guard.get(&0).map(|v| v.as_slice()).unwrap_or(&[]),
+                ),
+                Self::valid_sstables_for_compact(
+                    guard.get(&1).map(|v| v.as_slice()).unwrap_or(&[]),
+                ),
             )
         };
         let needs_rewrite = valid_l0
@@ -437,9 +450,7 @@ impl CompactionManager {
             None => timeout(Duration::from_secs(5), sstables.write())
                 .await
                 .map_err(|_| {
-                    LsmError::Internal(
-                        "Failed to acquire compaction lock to install L1".into(),
-                    )
+                    LsmError::Internal("Failed to acquire compaction lock to install L1".into())
                 })?,
         };
 

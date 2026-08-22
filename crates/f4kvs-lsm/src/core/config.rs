@@ -673,7 +673,8 @@ impl LsmConfig {
         // Validate performance configuration
         if self.performance.max_parallel_reads == 0 {
             errors.push("performance.max_parallel_reads must be greater than 0".to_string());
-        } else if self.performance.enable_parallel_reads && self.performance.max_parallel_reads > 100
+        } else if self.performance.enable_parallel_reads
+            && self.performance.max_parallel_reads > 100
         {
             errors.push("performance.max_parallel_reads should not exceed 100".to_string());
         }

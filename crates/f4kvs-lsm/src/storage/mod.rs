@@ -6,14 +6,14 @@
 pub mod block_cache;
 pub mod file_reader;
 pub mod flat_index;
-pub mod mmap_reader;
 pub mod memtable;
+pub mod mmap_reader;
 pub mod sstable;
 pub mod wal;
 pub mod wal_frame;
+pub mod wal_group_commit;
 pub mod wal_handle;
 pub mod wal_index;
-pub mod wal_group_commit;
 pub mod wal_indexed;
 pub mod wal_sync;
 

@@ -51,7 +51,10 @@ impl MmapHybridReader {
 
     /// Whether the backing file handle is open.
     pub fn is_open(&self) -> bool {
-        self.inner.read().map(|state| state.file_size > 0).unwrap_or(false)
+        self.inner
+            .read()
+            .map(|state| state.file_size > 0)
+            .unwrap_or(false)
     }
 
     /// Close mmap mapping and release cached state.
@@ -68,7 +71,10 @@ impl MmapHybridReader {
         }
 
         let state = self.inner.read().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("mmap reader lock poisoned: {e}"))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("mmap reader lock poisoned: {e}"),
+            )
         })?;
 
         if offset >= state.file_size {
@@ -114,7 +120,10 @@ impl MmapHybridReader {
 
     fn read_via_syscall(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let mut state = self.inner.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("mmap reader lock poisoned: {e}"))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("mmap reader lock poisoned: {e}"),
+            )
         })?;
 
         state.ensure_mapped()?;
@@ -303,7 +312,12 @@ fn maybe_cleanup_mincore_cache(
     }
 
     if next_cleanup
-        .compare_exchange(previous, now + ttl_secs, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(
+            previous,
+            now + ttl_secs,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .is_err()
     {
         return;

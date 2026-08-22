@@ -54,8 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sorted = latencies_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!("fsync_all after each ~{wal_entry_bytes}B append (raw file):");
-        println!("  total: {:.1} ms  mean: {:.3} ms  min: {:.3}  p50: {:.3}  p99: {:.3}  max: {:.3}",
-            total, total / n as f64, sorted[0], pct(&sorted, 50.0), pct(&sorted, 99.0), sorted[n - 1]);
+        println!(
+            "  total: {:.1} ms  mean: {:.3} ms  min: {:.3}  p50: {:.3}  p99: {:.3}  max: {:.3}",
+            total,
+            total / n as f64,
+            sorted[0],
+            pct(&sorted, 50.0),
+            pct(&sorted, 99.0),
+            sorted[n - 1]
+        );
         println!();
     }
 
@@ -79,8 +86,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sorted = latencies_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!("engine.put (WalSyncMode::Fsync, default):");
-        println!("  total: {:.1} ms  mean: {:.3} ms  min: {:.3}  p50: {:.3}  p99: {:.3}  max: {:.3}",
-            total, total / n as f64, sorted[0], pct(&sorted, 50.0), pct(&sorted, 99.0), sorted[n - 1]);
+        println!(
+            "  total: {:.1} ms  mean: {:.3} ms  min: {:.3}  p50: {:.3}  p99: {:.3}  max: {:.3}",
+            total,
+            total / n as f64,
+            sorted[0],
+            pct(&sorted, 50.0),
+            pct(&sorted, 99.0),
+            sorted[n - 1]
+        );
         println!();
     }
 
@@ -97,7 +111,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine.put(key, &payload).await?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("engine.put (WalSyncMode::None): {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "engine.put (WalSyncMode::None): {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     Ok(())

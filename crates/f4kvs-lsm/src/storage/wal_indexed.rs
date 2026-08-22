@@ -436,12 +436,8 @@ impl IndexedWalManager {
         self.scan_existing_segments().await?;
 
         if self.index_path.exists() {
-            let mut index = WalIndexFile::open(
-                self.index_path.clone(),
-                0,
-                self.frame_size as u32,
-            )
-            .await?;
+            let mut index =
+                WalIndexFile::open(self.index_path.clone(), 0, self.frame_size as u32).await?;
             if let Ok(state) = index.read_latest().await {
                 let frames_dir = segment_frames_dir(&self.wal_dir, state.segment_id);
                 if frames_dir.exists() {
@@ -506,8 +502,7 @@ impl IndexedWalManager {
                     let mut state = index.latest();
                     if !segment.flush_staging(index, &mut state).await? {
                         return Err(LsmError::Internal(
-                            "indexed wal segment full with unflushed staging; cannot rotate"
-                                .into(),
+                            "indexed wal segment full with unflushed staging; cannot rotate".into(),
                         ));
                     }
                 }
@@ -537,12 +532,8 @@ impl IndexedWalManager {
         )
         .await?;
 
-        let mut index = WalIndexFile::open(
-            self.index_path.clone(),
-            segment_id,
-            self.frame_size as u32,
-        )
-        .await?;
+        let mut index =
+            WalIndexFile::open(self.index_path.clone(), segment_id, self.frame_size as u32).await?;
         let mut header = index.latest();
         header.segment_id = segment_id;
         header.frame_size = self.frame_size as u32;
@@ -581,9 +572,9 @@ impl IndexedWalManager {
                     LsmError::Internal("indexed wal segment not initialized".into())
                 })?;
                 let mut index_guard = self.index.write().await;
-                let index = index_guard.as_mut().ok_or_else(|| {
-                    LsmError::Internal("wal.idx not initialized".into())
-                })?;
+                let index = index_guard
+                    .as_mut()
+                    .ok_or_else(|| LsmError::Internal("wal.idx not initialized".into()))?;
                 let mut state = index.latest();
                 segment.append_entry(entry, index, &mut state).await?
             };
@@ -625,9 +616,9 @@ impl IndexedWalManager {
                     LsmError::Internal("indexed wal segment not initialized".into())
                 })?;
                 let mut index_guard = self.index.write().await;
-                let index = index_guard.as_mut().ok_or_else(|| {
-                    LsmError::Internal("wal.idx not initialized".into())
-                })?;
+                let index = index_guard
+                    .as_mut()
+                    .ok_or_else(|| LsmError::Internal("wal.idx not initialized".into()))?;
                 let mut state = index.latest();
                 segment
                     .append_entries_batch(&entries[offset..], index, &mut state)
@@ -717,9 +708,8 @@ impl IndexedWalManager {
                 )
                 .await?;
                 let state = if active_segment_id == Some(segment_id) {
-                    active_state.unwrap_or_else(|| {
-                        WalIndexHeader::new(segment_id, self.frame_size as u32)
-                    })
+                    active_state
+                        .unwrap_or_else(|| WalIndexHeader::new(segment_id, self.frame_size as u32))
                 } else {
                     // Sealed segment: read all frames present (watermark = max frame file).
                     let mut sealed = WalIndexHeader::new(segment_id, self.frame_size as u32);
@@ -1039,6 +1029,10 @@ mod tests {
         let wal2 = IndexedWalManager::new(&cfg).unwrap();
         wal2.initialize().await.unwrap();
         let entries = wal2.read_entries_from_disk().await.unwrap();
-        assert_eq!(entries.len(), 80, "all puts across rotated segments must recover");
+        assert_eq!(
+            entries.len(),
+            80,
+            "all puts across rotated segments must recover"
+        );
     }
 }

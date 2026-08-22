@@ -44,14 +44,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         })
         .await?;
-        let items: Vec<(String, Value)> = keys
-            .iter()
-            .map(|k| (k.clone(), payload.clone()))
-            .collect();
+        let items: Vec<(String, Value)> =
+            keys.iter().map(|k| (k.clone(), payload.clone())).collect();
         let t0 = Instant::now();
         engine.batch_put(items).await?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!("batch_put x{n} (1 WAL batch): {ms:.1} ms ({:.3} ms/op)", ms / n as f64);
+        println!(
+            "batch_put x{n} (1 WAL batch): {ms:.1} ms ({:.3} ms/op)",
+            ms / n as f64
+        );
     }
 
     // --- batch_put chunks of 100 ---
@@ -64,10 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         let t0 = Instant::now();
         for chunk in keys.chunks(100) {
-            let items: Vec<(String, Value)> = chunk
-                .iter()
-                .map(|k| (k.clone(), payload.clone()))
-                .collect();
+            let items: Vec<(String, Value)> =
+                chunk.iter().map(|k| (k.clone(), payload.clone())).collect();
             engine.batch_put(items).await?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;

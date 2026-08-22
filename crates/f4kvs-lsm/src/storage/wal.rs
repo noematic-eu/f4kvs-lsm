@@ -115,7 +115,10 @@ impl WALSegment {
         if !path.exists() {
             return Ok(None);
         }
-        let file_len = tokio::fs::metadata(&path).await.map_err(LsmError::Io)?.len();
+        let file_len = tokio::fs::metadata(&path)
+            .await
+            .map_err(LsmError::Io)?
+            .len();
         let header_size = bincode::serialized_size(&WALSegmentHeader {
             magic: Self::MAGIC,
             version: Self::VERSION,
@@ -601,9 +604,7 @@ impl WALManager {
             return Ok(false);
         }
         let last_id = next_id - 1;
-        let path = self
-            .wal_dir
-            .join(format!("segment_{:016x}.wal", last_id));
+        let path = self.wal_dir.join(format!("segment_{:016x}.wal", last_id));
         match WALSegment::open_empty_for_append(
             path,
             self.config.segment_size as u64,
@@ -1463,7 +1464,9 @@ impl WALManager {
             let mut guard = self.group_commit_queue.lock().await;
             let was_empty = guard.pending.is_empty();
             guard.timing.record_enqueue(was_empty);
-            guard.pending.push(PendingGroupCommitEntry { entry, ack: tx });
+            guard
+                .pending
+                .push(PendingGroupCommitEntry { entry, ack: tx });
             let batch_full = guard.pending.len() >= self.config.group_commit_max_batch_size;
             (rx, batch_full)
         };

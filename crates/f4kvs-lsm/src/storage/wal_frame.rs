@@ -406,9 +406,7 @@ impl FrameWalManager {
         let segment_id = self
             .segment_counter
             .load(std::sync::atomic::Ordering::SeqCst);
-        let segment_path = self
-            .wal_dir
-            .join(format!("frame_{:016x}.wal", segment_id));
+        let segment_path = self.wal_dir.join(format!("frame_{:016x}.wal", segment_id));
         let segment = FrameWalSegment::new(
             segment_path,
             self.config.segment_size as u64,
@@ -451,9 +449,9 @@ impl FrameWalManager {
     pub async fn write_entry(&self, entry: &WALEntry) -> Result<()> {
         let needs_rotation = {
             let mut guard = self.current_segment.write().await;
-            let segment = guard.as_mut().ok_or_else(|| {
-                LsmError::Internal("No current frame WAL segment".to_string())
-            })?;
+            let segment = guard
+                .as_mut()
+                .ok_or_else(|| LsmError::Internal("No current frame WAL segment".to_string()))?;
             let success = segment.write_entry(entry).await?;
             !success
         };
@@ -849,7 +847,9 @@ impl FrameWalManager {
             let mut guard = self.group_commit_queue.lock().await;
             let was_empty = guard.pending.is_empty();
             guard.timing.record_enqueue(was_empty);
-            guard.pending.push(PendingGroupCommitEntry { entry, ack: tx });
+            guard
+                .pending
+                .push(PendingGroupCommitEntry { entry, ack: tx });
             let batch_full = guard.pending.len() >= self.config.group_commit_max_batch_size;
             (rx, batch_full)
         };

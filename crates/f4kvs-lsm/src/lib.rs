@@ -44,12 +44,12 @@
 //! ```
 
 // Re-export core types for convenience
-pub use f4kvs_value::{F4KvsError, Result as CoreResult, Value};
 pub use f4kvs_storage_core::{
     stats::StorageStats,
     traits::{KeyValueIterator, Storage, StorageEngine, Transaction},
     StorageConfig,
 };
+pub use f4kvs_value::{F4KvsError, Result as CoreResult, Value};
 
 // Internal modules
 pub mod compaction;

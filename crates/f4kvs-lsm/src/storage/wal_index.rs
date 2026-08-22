@@ -78,7 +78,9 @@ impl WalIndexHeader {
         if slot.len() < 44 {
             return Err(LsmError::Corruption("wal.idx slot too small".into()));
         }
-        let magic: [u8; 4] = slot[0..4].try_into().map_err(|_| LsmError::Corruption("wal.idx magic".into()))?;
+        let magic: [u8; 4] = slot[0..4]
+            .try_into()
+            .map_err(|_| LsmError::Corruption("wal.idx magic".into()))?;
         if magic != WAL_INDEX_MAGIC {
             return Err(LsmError::Corruption("wal.idx bad magic".into()));
         }
@@ -122,7 +124,9 @@ impl WalIndexFile {
 
     pub async fn open(path: PathBuf, segment_id: u32, frame_size: u32) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(LsmError::Io)?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(LsmError::Io)?;
         }
 
         let file = OpenOptions::new()
@@ -209,10 +213,7 @@ impl WalIndexFile {
             .seek(tokio::io::SeekFrom::Start(offset))
             .await
             .map_err(LsmError::Io)?;
-        self.file
-            .write_all(&bytes)
-            .await
-            .map_err(LsmError::Io)?;
+        self.file.write_all(&bytes).await.map_err(LsmError::Io)?;
         self.file.flush().await.map_err(LsmError::Io)?;
         if durable {
             crate::storage::wal_sync::sync_path(
