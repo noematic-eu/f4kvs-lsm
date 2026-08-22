@@ -513,7 +513,9 @@ pub struct SSTable {
     bloom_filter: Option<BloomFilter>,
 
     /// Random-access file reader (seek or positioned reads, depending on config).
-    reader: SstableFileReader,
+    /// Shared across clones so Get can drop the live-map lock and still use the
+    /// already-open FD (reopening every clone would burn FDs under soak load).
+    reader: Arc<SstableFileReader>,
 
     /// Last access time for LRU eviction (nanoseconds since epoch)
     last_access: std::sync::atomic::AtomicU64,
@@ -568,7 +570,7 @@ impl SSTable {
             index_loaded: std::sync::atomic::AtomicBool::new(false),
             index_load_lock: std::sync::Mutex::new(()),
             bloom_filter: None,
-            reader,
+            reader: Arc::new(reader),
             last_access: std::sync::atomic::AtomicU64::new(0),
             reader_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             marked_for_deletion: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -617,7 +619,10 @@ impl SSTable {
             .write_all(SST_COMPRESSED_MAGIC)
             .await
             .map_err(LsmError::Io)?;
-        writer.write_all(&[1u8, 0, 0, 0]).await.map_err(LsmError::Io)?;
+        writer
+            .write_all(&[1u8, 0, 0, 0])
+            .await
+            .map_err(LsmError::Io)?;
         file_hasher.update(SST_COMPRESSED_MAGIC);
         file_hasher.update(&[1u8, 0, 0, 0]);
 
@@ -924,20 +929,14 @@ impl SSTable {
     /// 10–25 ms per SSTable and dominated shard open on large catalogs.
     /// Concurrent callers are serialized; the decode happens once.
     pub fn ensure_index_loaded(&self) -> Result<()> {
-        if self
-            .index_loaded
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.index_loaded.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         let _serialize = self
             .index_load_lock
             .lock()
             .map_err(|_| LsmError::Internal("index load lock poisoned".into()))?;
-        if self
-            .index_loaded
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.index_loaded.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
 
@@ -1041,11 +1040,15 @@ impl SSTable {
     }
 
     pub(crate) fn index_key_at(&self, pos: usize) -> Option<Vec<u8>> {
+        self.with_index_key_at(pos, |k| k.map(|b| b.to_vec()))
+    }
+
+    pub(crate) fn with_index_key_at<R>(&self, pos: usize, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
         match self.index_guard() {
-            Ok(idx) => idx.at(pos).map(|(k, _)| k.to_vec()),
+            Ok(idx) => f(idx.at(pos).map(|(k, _)| k)),
             Err(e) => {
                 log::error!("index_key_at: index unavailable for {:?}: {}", self.path, e);
-                None
+                f(None)
             }
         }
     }
@@ -1205,14 +1208,18 @@ impl SSTable {
         self.ensure_file_open_sync()?;
         let unc_len = self.reader.read_u32_le_at_blocking(block_off)?;
         let comp_len = self.reader.read_u32_le_at_blocking(block_off + 4)?;
-        if unc_len == 0 || unc_len > 128 * 1024 * 1024 || comp_len == 0 || comp_len > 128 * 1024 * 1024
+        if unc_len == 0
+            || unc_len > 128 * 1024 * 1024
+            || comp_len == 0
+            || comp_len > 128 * 1024 * 1024
         {
             return Err(LsmError::Corruption(format!(
                 "invalid snappy block header at {block_off} unc={unc_len} comp={comp_len}"
             )));
         }
         let mut comp = vec![0u8; comp_len as usize];
-        self.reader.read_exact_at_blocking(block_off + 8, &mut comp)?;
+        self.reader
+            .read_exact_at_blocking(block_off + 8, &mut comp)?;
         let raw = snap_decompress(&comp)?;
         if raw.len() != unc_len as usize {
             return Err(LsmError::Corruption(format!(
@@ -1241,7 +1248,10 @@ impl SSTable {
             let block = self.read_snappy_block_sync(offset, block_cache)?;
             return parse_framed_entry(&block, loc as usize);
         }
-        let file_size = self.metadata.file_size.max(self.reader.file_size_blocking()?);
+        let file_size = self
+            .metadata
+            .file_size
+            .max(self.reader.file_size_blocking()?);
         if offset + 8 > file_size {
             return Err(LsmError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -1837,6 +1847,15 @@ impl SSTable {
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// Pin this handle. The guard unpins on drop without touching the live map,
+    /// so a concurrent compaction write lock cannot leak the pin.
+    pub(crate) fn pin(&self) -> SstableReadPin {
+        self.pin_reader();
+        SstableReadPin {
+            reader_count: Arc::clone(&self.reader_count),
+        }
+    }
+
     /// Check if safe to delete (no active readers)
     pub fn can_delete(&self) -> bool {
         self.reader_count.load(std::sync::atomic::Ordering::Acquire) == 0
@@ -2096,7 +2115,11 @@ impl SSTable {
     /// This is useful for validation that the index was loaded correctly
     pub fn index_size(&self) -> usize {
         if let Err(e) = self.ensure_index_loaded() {
-            log::error!("index_size: failed to load index for {:?}: {}", self.path, e);
+            log::error!(
+                "index_size: failed to load index for {:?}: {}",
+                self.path,
+                e
+            );
             return 0;
         }
         self.index.read().map(|g| g.len()).unwrap_or(0)
@@ -2133,20 +2156,13 @@ impl SSTable {
             path: self.path.clone(),
             config: self.config.clone(),
             metadata: self.metadata.clone(),
-            index: std::sync::RwLock::new(
-                self.index.read().map(|g| g.clone()).unwrap_or_default(),
-            ),
+            index: std::sync::RwLock::new(self.index.read().map(|g| g.clone()).unwrap_or_default()),
             index_loaded: std::sync::atomic::AtomicBool::new(
-                self.index_loaded
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.index_loaded.load(std::sync::atomic::Ordering::Relaxed),
             ),
             index_load_lock: std::sync::Mutex::new(()),
             bloom_filter: self.bloom_filter.clone(),
-            reader: SstableFileReader::new(
-                self.path.clone(),
-                self.config.read_mode,
-                self.config.mincore_cache_ttl_secs,
-            ),
+            reader: Arc::clone(&self.reader),
             last_access: std::sync::atomic::AtomicU64::new(
                 self.last_access.load(std::sync::atomic::Ordering::Relaxed),
             ),
@@ -2167,6 +2183,18 @@ impl SSTable {
 impl Clone for SSTable {
     fn clone(&self) -> Self {
         self.clone_for_testing()
+    }
+}
+
+/// RAII pin that decrements `reader_count` on drop without taking the live-map lock.
+pub(crate) struct SstableReadPin {
+    reader_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for SstableReadPin {
+    fn drop(&mut self) {
+        self.reader_count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -2228,7 +2256,9 @@ mod compress_tests {
         let head = std::fs::read(&path).unwrap();
         assert_eq!(&head[..4], b"F4SC");
 
-        let got = sst.lookup_sync("dDocuments/path/0007/file.txt", None).unwrap();
+        let got = sst
+            .lookup_sync("dDocuments/path/0007/file.txt", None)
+            .unwrap();
         match got {
             SstableLookupResult::Found { value, .. } => {
                 assert!(matches!(value, Value::Bytes(_)));
@@ -2289,5 +2319,20 @@ mod compress_tests {
         sst.unpin_reader();
         assert_eq!(clone.reader_count(), 0);
         assert!(clone.can_delete());
+    }
+
+    #[test]
+    fn pin_guard_unpins_without_map_lock() {
+        let dir = TempDir::new().unwrap();
+        let sst = SSTable::new(dir.path().join("pin2.sst"), SstableConfig::default(), 0).unwrap();
+        {
+            let _pin = sst.pin();
+            assert_eq!(sst.reader_count(), 1);
+        }
+        assert_eq!(
+            sst.reader_count(),
+            0,
+            "Drop must unpin even with no map lock"
+        );
     }
 }

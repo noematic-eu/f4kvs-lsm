@@ -80,26 +80,6 @@ fn parse_sstable_flush_sequence_from_filename(file_name: &str) -> Option<u64> {
 /// Plain decimal text so operators can inspect it; written atomically via rename.
 const SEQUENCE_FILE_NAME: &str = "SEQUENCE";
 
-/// RAII guard that prevents LRU eviction from closing an SSTable during a read.
-struct SstableReadPin {
-    sstables: Arc<RwLock<HashMap<usize, Vec<SSTable>>>>,
-    level: usize,
-    idx: usize,
-}
-
-impl Drop for SstableReadPin {
-    fn drop(&mut self) {
-        if let Ok(sstables) = self.sstables.try_read() {
-            if let Some(sstable) = sstables
-                .get(&self.level)
-                .and_then(|level_sstables| level_sstables.get(self.idx))
-            {
-                sstable.unpin_reader();
-            }
-        }
-    }
-}
-
 #[cfg(feature = "metrics")]
 use crate::metrics::MetricsRecorder;
 #[cfg(feature = "metrics")]
@@ -595,6 +575,10 @@ impl LsmTreeEngine {
     }
 
     async fn prefix_scan_advance(&self, st: &mut PrefixScanState, key: &str) {
+        self.prefix_scan_advance_sync(st, key);
+    }
+
+    fn prefix_scan_advance_sync(&self, st: &mut PrefixScanState, key: &str) {
         st.last = Some(key.to_owned());
         for head in st.heads.iter_mut() {
             if head.sst.index_key_eq(head.pos, key.as_bytes()) {
@@ -603,11 +587,7 @@ impl LsmTreeEngine {
         }
     }
 
-    async fn prefix_scan_resolve(
-        &self,
-        st: &PrefixScanState,
-        key: &str,
-    ) -> Result<Option<Value>> {
+    async fn prefix_scan_resolve(&self, st: &PrefixScanState, key: &str) -> Result<Option<Value>> {
         use crate::storage::sstable::SstableLookupResult;
         match self.get_from_memtables(key).await? {
             MemtableLookupResult::Found(value) => return Ok(Some(value)),
@@ -645,6 +625,180 @@ impl LsmTreeEngine {
             Some(SstableLookupResult::Tombstone { .. }) | None => None,
             Some(SstableLookupResult::Missing) => None,
         })
+    }
+
+    /// Non-blocking prefix scan start. `None` if a writer holds the SST map lock.
+    pub fn try_prefix_scan_start_sync(&self, prefix: &str) -> Option<Result<PrefixScanState>> {
+        let sstables = self.sstables.try_read().ok()?;
+        let mut heads = Vec::new();
+        for (&level, files) in sstables.iter() {
+            for sstable in files.iter() {
+                if !sstable.is_ready() || sstable.is_marked_for_deletion() {
+                    continue;
+                }
+                let pos = sstable.index_start(prefix);
+                let sst = sstable.clone();
+                sst.pin_reader();
+                heads.push(PrefixScanHead { sst, level, pos });
+            }
+        }
+        Some(Ok(PrefixScanState {
+            prefix: prefix.to_owned(),
+            last: None,
+            heads,
+        }))
+    }
+
+    /// Pull up to `max` live pairs without Tokio. `None` if a write lock is held
+    /// (caller should fall back to async `prefix_scan_next`). `eof` is true when
+    /// the prefix is exhausted.
+    pub fn try_prefix_scan_next_n_sync(
+        &self,
+        st: &mut PrefixScanState,
+        max: usize,
+    ) -> Option<std::result::Result<(Vec<(String, Value)>, bool), F4KvsError>> {
+        let _op = self.operation_guard.try_read().ok()?;
+        let mut items = Vec::with_capacity(max);
+        let mut eof = false;
+        while items.len() < max {
+            let key = match self.prefix_scan_min_key_sync(st)? {
+                Some(k) => k,
+                None => {
+                    eof = true;
+                    break;
+                }
+            };
+            let resolved = match self.prefix_scan_resolve_sync(st, &key)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(Self::convert_error(e))),
+            };
+            self.prefix_scan_advance_sync(st, &key);
+            if let Some(value) = resolved {
+                items.push((key, value));
+            }
+        }
+        Some(Ok((items, eof)))
+    }
+
+    fn prefix_scan_min_key_sync(&self, st: &PrefixScanState) -> Option<Option<String>> {
+        let prefix = st.prefix.as_bytes();
+        let after = st.last.as_deref().map(str::as_bytes);
+        let mut best: Option<Vec<u8>> = None;
+        let consider = |best: &mut Option<Vec<u8>>, cand: &[u8]| {
+            if !cand.starts_with(prefix) {
+                return;
+            }
+            if after.map(|a| cand <= a).unwrap_or(false) {
+                return;
+            }
+            if best.as_deref().map(|b| cand < b).unwrap_or(true) {
+                *best = Some(cand.to_vec());
+            }
+        };
+        for head in &st.heads {
+            head.sst.with_index_key_at(head.pos, |k| {
+                if let Some(k) = k {
+                    consider(&mut best, k);
+                }
+            });
+        }
+        {
+            let mt = self.active_memtable.try_read().ok()?;
+            if let Some(k) = mt.first_key_after_sync(&st.prefix, st.last.as_deref())? {
+                consider(&mut best, k.as_bytes());
+            }
+        }
+        {
+            let imm = self.immutable_memtables.try_read().ok()?;
+            for mt in imm.iter() {
+                if let Some(k) = mt.first_key_after_sync(&st.prefix, st.last.as_deref())? {
+                    consider(&mut best, k.as_bytes());
+                }
+            }
+        }
+        Some(best.map(|b| String::from_utf8_lossy(&b).into_owned()))
+    }
+
+    /// Visit every live prefix pair. `visit` receives borrowed key/value valid
+    /// only for the call. Returns `None` if a write lock is held.
+    /// `visit` returning false stops the scan.
+    pub fn try_prefix_scan_foreach_sync(
+        &self,
+        prefix: &str,
+        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Option<std::result::Result<(), F4KvsError>> {
+        let mut st = match self.try_prefix_scan_start_sync(prefix) {
+            None => return None,
+            Some(Ok(s)) => s,
+            Some(Err(e)) => return Some(Err(Self::convert_error(e))),
+        };
+        let _op = self.operation_guard.try_read().ok()?;
+        loop {
+            let key = match self.prefix_scan_min_key_sync(&st)? {
+                Some(k) => k,
+                None => return Some(Ok(())),
+            };
+            let resolved = match self.prefix_scan_resolve_sync(&st, &key)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(Self::convert_error(e))),
+            };
+            self.prefix_scan_advance_sync(&mut st, &key);
+            let Some(value) = resolved else {
+                continue;
+            };
+            let payload: &[u8] = match &value {
+                Value::Bytes(b) => b.as_slice(),
+                Value::String(s) => s.as_bytes(),
+                _ => continue,
+            };
+            if !visit(key.as_bytes(), payload) {
+                return Some(Ok(()));
+            }
+        }
+    }
+
+    fn prefix_scan_resolve_sync(
+        &self,
+        st: &PrefixScanState,
+        key: &str,
+    ) -> Option<Result<Option<Value>>> {
+        use crate::storage::sstable::SstableLookupResult;
+        match self.get_from_memtables_sync(key)? {
+            MemtableLookupResult::Found(value) => return Some(Ok(Some(value))),
+            MemtableLookupResult::Tombstone => return Some(Ok(None)),
+            MemtableLookupResult::Missing => {}
+        }
+        let mut best_ts: u64 = 0;
+        let mut best: Option<SstableLookupResult> = None;
+        for head in &st.heads {
+            if !head.sst.index_key_eq(head.pos, key.as_bytes()) {
+                continue;
+            }
+            match head.sst.lookup_sync(key, Some(&self.block_cache)) {
+                Ok(SstableLookupResult::Missing) => {}
+                Ok(hit) => {
+                    let ts = match &hit {
+                        SstableLookupResult::Found { timestamp, .. } => *timestamp,
+                        SstableLookupResult::Tombstone { timestamp } => *timestamp,
+                        SstableLookupResult::Missing => 0,
+                    };
+                    if head.level == 0 {
+                        if ts >= best_ts {
+                            best_ts = ts;
+                            best = Some(hit);
+                        }
+                    } else if best.is_none() {
+                        best = Some(hit);
+                    }
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(match best {
+            Some(SstableLookupResult::Found { value, .. }) => Some(value),
+            Some(SstableLookupResult::Tombstone { .. }) | None => None,
+            Some(SstableLookupResult::Missing) => None,
+        }))
     }
 
     /// Rebuild live key count from SSTable metadata + memtables (startup).
@@ -905,7 +1059,8 @@ impl LsmTreeEngine {
         if let Ok(entries) = std::fs::read_dir(data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned)
+                if let Some(file_name) =
+                    path.file_name().and_then(|n| n.to_str()).map(str::to_owned)
                 {
                     if let Some(seq) = parse_sstable_flush_sequence_from_filename(&file_name) {
                         max_flush_seq = max_flush_seq.max(seq);
@@ -964,11 +1119,7 @@ impl LsmTreeEngine {
                     a.metadata()
                         .largest_key
                         .cmp(&b.metadata().largest_key)
-                        .then_with(|| {
-                            a.metadata()
-                                .smallest_key
-                                .cmp(&b.metadata().smallest_key)
-                        })
+                        .then_with(|| a.metadata().smallest_key.cmp(&b.metadata().smallest_key))
                 });
             }
         }
@@ -1947,35 +2098,27 @@ impl LsmTreeEngine {
         None
     }
 
-    /// Pin an SSTable for reading so LRU eviction cannot close its file handle.
-    /// Returns `(pin, already_open)` so Get can skip the capacity/reopen path.
-    async fn pin_sstable_reader(&self, level: usize, idx: usize) -> Option<(SstableReadPin, bool)> {
+    /// Snapshot one SSTable out of the live map and pin it.
+    ///
+    /// The clone shares pin state and the file reader, so the caller can drop
+    /// the map lock before I/O. Compaction can then take the write lock instead
+    /// of timing out under a soak of concurrent Gets (165114Z / 19ccd74).
+    async fn pin_sstable_clone(
+        &self,
+        level: usize,
+        idx: usize,
+    ) -> Option<(SSTable, crate::storage::sstable::SstableReadPin, bool)> {
         let sstables = self.sstables.read().await;
-        let sstable = sstables.get(&level)?.get(idx)?;
-        sstable.pin_reader();
+        let sstable = sstables.get(&level)?.get(idx)?.clone();
         let already_open = sstable.is_open();
-        Some((
-            SstableReadPin {
-                sstables: Arc::clone(&self.sstables),
-                level,
-                idx,
-            },
-            already_open,
-        ))
+        let pin = sstable.pin();
+        Some((sstable, pin, already_open))
     }
 
-    /// Open an SSTable file if needed.
-    ///
-    /// Caller must hold an [`SstableReadPin`] so LRU eviction cannot close the file
-    /// between opening and reading. No-op when the FD is already cached.
-    async fn ensure_sstable_open(&self, level: usize, idx: usize) {
-        {
-            let sstables = self.sstables.read().await;
-            match sstables.get(&level).and_then(|level_sstables| level_sstables.get(idx)) {
-                Some(sstable) if sstable.is_open() => return,
-                None => return,
-                Some(_) => {}
-            }
+    /// Open a pinned SSTable clone if the shared reader has no cached FD.
+    async fn ensure_cloned_sstable_open(&self, sstable: &SSTable, level: usize, idx: usize) {
+        if sstable.is_open() {
+            return;
         }
         if let Err(e) = self.ensure_file_handle_capacity().await {
             warn!(
@@ -1983,19 +2126,14 @@ impl LsmTreeEngine {
                 level, idx, e
             );
         }
-        let sstables = self.sstables.read().await;
-        if let Some(level_sstables) = sstables.get(&level) {
-            if let Some(sstable) = level_sstables.get(idx) {
-                if let Err(e) = sstable.ensure_file_open().await {
-                    warn!(
-                        "Failed to ensure SSTable open L{}[{}] {:?}: {}",
-                        level,
-                        idx,
-                        sstable.path(),
-                        e
-                    );
-                }
-            }
+        if let Err(e) = sstable.ensure_file_open().await {
+            warn!(
+                "Failed to ensure SSTable open L{}[{}] {:?}: {}",
+                level,
+                idx,
+                sstable.path(),
+                e
+            );
         }
     }
 
@@ -2118,21 +2256,14 @@ impl LsmTreeEngine {
             let mut best: Option<SstableLookupResult> = None;
 
             for idx in candidate_indices {
-                let Some((_read_pin, already_open)) = self.pin_sstable_reader(level, idx).await
+                let Some((sstable, _read_pin, already_open)) =
+                    self.pin_sstable_clone(level, idx).await
                 else {
                     continue;
                 };
                 if !already_open {
-                    self.ensure_sstable_open(level, idx).await;
+                    self.ensure_cloned_sstable_open(&sstable, level, idx).await;
                 }
-                let sstables = self.sstables.read().await;
-                let Some(sstable) = sstables
-                    .get(&level)
-                    .and_then(|level_sstables| level_sstables.get(idx))
-                else {
-                    continue;
-                };
-                let sstable = &*sstable;
                 #[cfg(feature = "metrics")]
                 record_sstable_read(&self.metrics);
                 match sstable.lookup_pinned(key, Some(&self.block_cache)).await {
@@ -4647,6 +4778,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_prefix_scan_next_n_sync_matches_async() {
+        let (engine, _tmp) = create_test_engine().await;
+        for i in 0..20 {
+            engine
+                .put(
+                    &format!("s/{i:02}"),
+                    &Value::Bytes(format!("v{i}").into_bytes()),
+                )
+                .await
+                .expect("put");
+        }
+        engine.flush().await.expect("flush");
+
+        let mut async_st = engine.prefix_scan_start("s/").await.expect("async start");
+        let mut async_got = Vec::new();
+        while let Some((k, v)) = engine
+            .prefix_scan_next(&mut async_st)
+            .await
+            .expect("async next")
+        {
+            async_got.push((k, v));
+        }
+
+        let mut sync_st = engine
+            .try_prefix_scan_start_sync("s/")
+            .expect("sync start lock")
+            .expect("sync start");
+        let mut sync_got = Vec::new();
+        loop {
+            let (page, eof) = engine
+                .try_prefix_scan_next_n_sync(&mut sync_st, 7)
+                .expect("sync next lock")
+                .expect("sync next");
+            sync_got.extend(page);
+            if eof {
+                break;
+            }
+        }
+        assert_eq!(sync_got, async_got);
+        assert_eq!(sync_got.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn try_prefix_scan_foreach_sync_visits_all() {
+        let (engine, _tmp) = create_test_engine().await;
+        for i in 0..15 {
+            engine
+                .put(
+                    &format!("f/{i:02}"),
+                    &Value::Bytes(format!("v{i}").into_bytes()),
+                )
+                .await
+                .expect("put");
+        }
+        engine.flush().await.expect("flush");
+        let mut got = Vec::new();
+        engine
+            .try_prefix_scan_foreach_sync("f/", |k, v| {
+                got.push((String::from_utf8(k.to_vec()).unwrap(), v.to_vec()));
+                true
+            })
+            .expect("lock")
+            .expect("foreach");
+        assert_eq!(got.len(), 15);
+        assert_eq!(got[0].0, "f/00");
+        assert_eq!(got[14].0, "f/14");
+    }
+
+    #[tokio::test]
     async fn test_column_families() {
         let (engine, _temp_dir) = create_test_engine().await;
 
@@ -6698,7 +6898,9 @@ mod tests {
     }
 
     /// Soak 165114Z: 0 background compact during 1h cache because get/put held
-    /// `operation_guard` read and `try_write` skipped every tick. L0 must still
+    /// `operation_guard` read and `try_write` skipped every tick. Comfort
+    /// 20260819T052358Z: after pin-sharing, reclaim held `compacting` for up
+    /// to 5s while Gets kept the map read lock — L0 stuck at 14. L0 must still
     /// drain while readers are in flight.
     #[tokio::test]
     async fn compaction_drains_l0_under_concurrent_reads() {
@@ -6957,7 +7159,10 @@ mod tests {
         };
         assert!(l1_reload >= 1, "L1 must reload after compact");
         for i in 0..N {
-            let got = engine.get(&format!("k{i}")).await.expect("get after reopen");
+            let got = engine
+                .get(&format!("k{i}"))
+                .await
+                .expect("get after reopen");
             assert_eq!(
                 got,
                 Some(Value::Bytes(format!("v{i}").into_bytes())),

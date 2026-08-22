@@ -151,9 +151,23 @@ impl Memtable {
     }
 
     /// First key in `(after, ∞)` that starts with `prefix`. `after = None` starts at prefix.
-    pub async fn first_key_after(&self, prefix: &str, after: Option<&str>) -> Result<Option<String>> {
+    pub async fn first_key_after(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Result<Option<String>> {
         let data = self.data.read().await;
         Ok(first_key_after_map(&data, prefix, after))
+    }
+
+    /// Non-blocking first_key_after. Outer `None` if a writer holds the lock.
+    pub fn first_key_after_sync(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Option<Option<String>> {
+        let data = self.data.try_read().ok()?;
+        Some(first_key_after_map(&data, prefix, after))
     }
 
     /// Non-blocking lookup. `None` if a writer holds the lock.
